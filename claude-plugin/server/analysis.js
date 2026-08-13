@@ -330,6 +330,13 @@ export function summarize(capture, options) {
         timedPasses: timed.length,
         slowestPass: { pass: slowest.pass, label: slowest.label, durationMs: slowest.durationMs }
       };
+    } else {
+      // No timings. Say why, so a "requested but lost" capture is not mistaken
+      // for one that simply didn't ask for timing.
+      const status = gpuTimingStatus(capture, null);
+      if (status && status.state !== "not-requested") {
+        summary.gpuTimingStatus = status;
+      }
     }
   }
   // Frame budget + CPU/GPU/vsync bound verdict, when the capture carried live
@@ -346,7 +353,7 @@ export function summarize(capture, options) {
       refreshMs: round3(fs.refreshMs),
       budgetMs: round3(budget),
       droppedTotal: fs.skippedTotal ?? null,
-      bound: classifyBound(num(fs.cpuSubmitMs), gpu, budget)
+      bound: classifyBound(num(fs.cpuSubmitMs), gpu, budget, gpuTimingStatus(capture, gpu))
     };
   }
   if (options.includeIssues !== false) {
@@ -686,7 +693,39 @@ function classifyPassBottleneck(p) {
 
 // CPU- vs GPU- vs vsync-bound from CPU submit time and GPU frame time against the
 // frame budget (display refresh). GPU time is null unless profilePasses was used.
-function classifyBound(cpuMs, gpuMs, budgetMs) {
+// Describes why a capture has no GPU timing, from the `timestampCapture`
+// metadata the page attaches at save time. Returns null when timings are
+// present. `state` is one of "not-requested" | "unsupported" | "missing";
+// "missing" means profilePasses was on and the device supported it, but no
+// timestamps reached the capture — a tool bug, not something a re-capture fixes.
+function gpuTimingStatus(capture, frameGpuTimeMs) {
+  if (frameGpuTimeMs != null) {
+    return null;
+  }
+  const ts = capture && capture.timestampCapture;
+  if (!ts || !ts.requested) {
+    return {
+      state: "not-requested",
+      detail: "capture was taken without profilePasses, so no per-pass GPU timing was recorded"
+    };
+  }
+  if (!ts.supported) {
+    return {
+      state: "unsupported",
+      detail: "profilePasses was requested but the adapter does not expose the \"timestamp-query\" feature"
+    };
+  }
+  return {
+    state: "missing",
+    detail: "profilePasses was requested and supported, but no timestamp data reached the capture — " +
+      "re-capturing with profilePasses will not help; this is a tool-side failure to report"
+  };
+}
+
+// CPU- vs GPU- vs vsync-bound from CPU submit time and GPU frame time against the
+// frame budget (display refresh). GPU time is null unless profilePasses was used.
+// `timingStatus` (from gpuTimingStatus) shapes the advice given when it is null.
+function classifyBound(cpuMs, gpuMs, budgetMs, timingStatus) {
   if (!(budgetMs > 0)) {
     return { verdict: "unknown", reason: "no frame budget (frameStats) in this capture" };
   }
@@ -698,7 +737,10 @@ function classifyBound(cpuMs, gpuMs, budgetMs) {
     return { verdict: "GPU", reason: `GPU work ${round3(gpuMs)}ms is ${pct(gpuMs)}% of the ${round3(budgetMs)}ms budget` };
   }
   if (gpuMs == null) {
-    return { verdict: "GPU-or-vsync", reason: "main thread has headroom; re-capture with profilePasses to measure GPU time and confirm" };
+    const why = timingStatus && timingStatus.state !== "not-requested"
+      ? `main thread has headroom, but GPU time is unavailable: ${timingStatus.detail}`
+      : "main thread has headroom; re-capture with profilePasses to measure GPU time and confirm";
+    return { verdict: "GPU-or-vsync", reason: why };
   }
   return { verdict: "vsync", reason: "both CPU and GPU have headroom under the frame budget" };
 }
@@ -719,7 +761,7 @@ function describeFill(p) {
 // Concrete, ranked improvement suggestions from the analysis.
 function buildSuggestions(capture, ctx) {
   const out = [];
-  const { ranked, bound, frameGpuTimeMs } = ctx;
+  const { ranked, bound, frameGpuTimeMs, timingStatus } = ctx;
 
   if (bound && bound.verdict === "CPU") {
     out.push("CPU/main-thread bound: cut per-frame submission cost — batch draws, use render " +
@@ -752,7 +794,17 @@ function buildSuggestions(capture, ctx) {
   }
 
   if (!frameGpuTimeMs) {
-    out.push("Re-capture with profilePasses:true to measure per-pass GPU time and get a CPU-vs-GPU-bound verdict.");
+    // Only suggest profilePasses when it hasn't already been tried — otherwise
+    // report why the timings are missing instead.
+    if (timingStatus && timingStatus.state === "unsupported") {
+      out.push("Per-pass GPU timing is unavailable on this adapter (no \"timestamp-query\" feature); " +
+        "rely on CPU submit time and pass workload estimates instead.");
+    } else if (timingStatus && timingStatus.state === "missing") {
+      out.push("profilePasses was requested but no GPU timings arrived — the timing data was lost in " +
+        "the capture pipeline, not absent from the frame. Re-capturing with profilePasses will not fix it.");
+    } else {
+      out.push("Re-capture with profilePasses:true to measure per-pass GPU time and get a CPU-vs-GPU-bound verdict.");
+    }
   }
   return out;
 }
@@ -766,6 +818,7 @@ export function analyzePerformance(capture) {
   const frameGpuTimeMs = timed.length
     ? round3(timed.reduce((s, p) => s + p.durationMs, 0))
     : null;
+  const timingStatus = gpuTimingStatus(capture, frameGpuTimeMs);
 
   const fs = capture && capture.frameStats;
   let frameBudget = null;
@@ -780,7 +833,7 @@ export function analyzePerformance(capture) {
       budgetMs: round3(budget),
       droppedTotal: fs.skippedTotal ?? null
     };
-    bound = classifyBound(num(fs.cpuSubmitMs), frameGpuTimeMs, budget);
+    bound = classifyBound(num(fs.cpuSubmitMs), frameGpuTimeMs, budget, timingStatus);
   } else if (frameGpuTimeMs != null) {
     bound = { verdict: "unknown", reason: "capture has GPU timing but no frameStats (CPU/refresh) context" };
   }
@@ -798,9 +851,10 @@ export function analyzePerformance(capture) {
     frameBudget,
     bound,
     gpuTiming: frameGpuTimeMs != null ? { frameGpuTimeMs, timedPasses: timed.length } : null,
+    gpuTimingStatus: timingStatus,
     passes: ranked.slice(0, 20),
     issues: findIssues(capture),
-    suggestions: buildSuggestions(capture, { ranked, bound, frameGpuTimeMs })
+    suggestions: buildSuggestions(capture, { ranked, bound, frameGpuTimeMs, timingStatus })
   };
 }
 
