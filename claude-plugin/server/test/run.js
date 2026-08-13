@@ -22,7 +22,9 @@ import {
 import { CaptureStore } from "../capture-store.js";
 import { Bridge } from "../bridge.js";
 import { isCaptureBinary, decodeCaptureBinary } from "../capture-binary.js";
-import { captureStreamToLines } from "../../../src/utils/local_capture.js";
+import { captureStreamToLines, LocalCaptureStore } from "../../../src/utils/local_capture.js";
+import { Actions } from "../../../src/utils/actions.js";
+import { encodeBase64 as pageEncodeBase64 } from "../../../src/utils/base64.js";
 // The browser-side twin of capture-binary.js — cross-codec tests below keep
 // the two implementations agreeing on the format.
 import {
@@ -377,6 +379,128 @@ await test("Bridge start() on a busy port falls back to an OS-assigned port", as
   } finally {
     await holder.stop();
   }
+});
+
+// --- Per-pass GPU timestamp merge ------------------------------------------
+
+// One CaptureBufferData message carrying a whole timestamp buffer (commandId
+// -1000). Pairs are [beginNs, endNs] per pass, in pass order.
+function timestampMessage(pairsNs) {
+  const values = new BigInt64Array(pairsNs.length * 2);
+  for (let i = 0; i < pairsNs.length; ++i) {
+    values[i * 2] = BigInt(pairsNs[i][0]);
+    values[i * 2 + 1] = BigInt(pairsNs[i][1]);
+  }
+  const bytes = new Uint8Array(values.buffer);
+  return {
+    action: Actions.CaptureBufferData,
+    commandId: -1000,
+    entryIndex: -1000,
+    offset: 0,
+    size: bytes.length,
+    index: 0,
+    count: 1,
+    chunk: pageEncodeBase64(bytes)
+  };
+}
+
+// Feed `commands` to a store as a single capture frame batch.
+function feedCommands(store, commands) {
+  store.processMessage({
+    action: Actions.CaptureFrameResults, frame: 0, count: commands.length, batches: 1
+  });
+  store.processMessage({
+    action: Actions.CaptureFrameCommands, frame: 0, commands, index: 0, count: commands.length
+  });
+}
+
+// A pass descriptor as the page records it after injection: `tsIndex` is the
+// slot in the inspector's query set. Pass null for a pass the inspector skipped
+// (one that already carried the application's own timestampWrites).
+function passCommand(commandId, method, tsIndex) {
+  const descriptor = {};
+  if (tsIndex !== null && tsIndex !== undefined) {
+    descriptor.__wgpuInspectorTimestampIndex = tsIndex;
+  }
+  return { commandId, method, args: [descriptor] };
+}
+
+await test("timestamp merge maps passes by query index, not position", async () => {
+  const store = new LocalCaptureStore();
+  feedCommands(store, [
+    passCommand(0, "beginRenderPass", 0),
+    { commandId: 1, method: "draw", args: [] },
+    passCommand(2, "beginRenderPass", 2)
+  ]);
+  store.processMessage(timestampMessage([[0, 1000000], [2000000, 4000000]]));
+
+  const { metadata } = store.buildCaptureStream("test");
+  const passes = metadata.commands.filter((c) => c.method === "beginRenderPass");
+  assert.deepEqual(passes.map((p) => p.duration), [1, 2]);
+});
+
+await test("passes with the app's own timestampWrites are skipped, not shifted", async () => {
+  const store = new LocalCaptureStore();
+  // Mirrors a real frame: the app times its own first and last passes, so the
+  // inspector injects only into the middle two. A positional merge would hand
+  // the first timing to the app-owned pass and shift everything down.
+  feedCommands(store, [
+    passCommand(0, "beginRenderPass", null),
+    passCommand(1, "beginRenderPass", 0),
+    passCommand(2, "beginComputePass", 2),
+    passCommand(3, "beginRenderPass", null)
+  ]);
+  store.processMessage(timestampMessage([[0, 1000000], [0, 2000000]]));
+
+  const { metadata } = store.buildCaptureStream("test");
+  const passes = metadata.commands;
+  assert.equal(passes[0].duration, undefined, "app-timed pass must stay untimed");
+  assert.equal(passes[1].duration, 1);
+  assert.equal(passes[2].duration, 2);
+  assert.equal(passes[3].duration, undefined);
+});
+
+await test("timestamp merge advances across submits instead of restarting", async () => {
+  const store = new LocalCaptureStore();
+  // The query index resets to 0 each submit, which is how the merge detects
+  // the boundary: submit 1 covers the first two passes, submit 2 the third.
+  feedCommands(store, [
+    passCommand(0, "beginRenderPass", 0),
+    passCommand(1, "beginComputePass", 2),
+    passCommand(2, "beginRenderPass", 0)
+  ]);
+  store.processMessage(timestampMessage([[0, 1000000], [0, 2000000]]));
+  store.processMessage(timestampMessage([[0, 9000000]]));
+
+  const { metadata } = store.buildCaptureStream("test");
+  assert.deepEqual(metadata.commands.map((p) => p.duration), [1, 2, 9]);
+});
+
+await test("timestamps arriving before their commands are still merged", async () => {
+  const store = new LocalCaptureStore();
+  // Chunk first, command batch second — the ordering that silently dropped
+  // timings when the merge ran eagerly inside the chunk handler.
+  store.processMessage(timestampMessage([[0, 3000000]]));
+  feedCommands(store, [passCommand(0, "beginRenderPass", 0)]);
+
+  const { metadata } = store.buildCaptureStream("test");
+  assert.equal(metadata.commands[0].duration, 3);
+});
+
+await test("resetCaptures drops half-received timestamp state", async () => {
+  const store = new LocalCaptureStore();
+  // A first chunk of a two-chunk buffer that never completes.
+  const partial = timestampMessage([[0, 1000000]]);
+  partial.count = 2;
+  partial.size = 32;
+  store.processMessage(partial);
+
+  store.resetCaptures();
+  feedCommands(store, [passCommand(0, "beginRenderPass", 0)]);
+  store.processMessage(timestampMessage([[0, 5000000]]));
+
+  const { metadata } = store.buildCaptureStream("test");
+  assert.equal(metadata.commands[0].duration, 5, "stale bytes must not corrupt the next capture");
 });
 
 // --- Summary ---------------------------------------------------------------
