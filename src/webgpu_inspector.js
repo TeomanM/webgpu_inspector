@@ -801,6 +801,16 @@ export let webgpuInspector = null;
       // CPU-, GPU-, or vsync-bound rather than just listing pass durations.
       stream.metadata.frameStats = this.getFrameStats();
 
+      // Record whether per-pass timing was asked for, and whether the device
+      // could actually provide it. Without this the analyzer can't tell "not
+      // requested" from "requested but the timings never arrived", and ends up
+      // advising a re-capture with the very option that was already used.
+      stream.metadata.timestampCapture = {
+        requested: !!this._captureTimestamps ||
+          !!(this._captureData && this._captureData.captureTimestamps),
+        supported: !!this._timestampQuerySupported
+      };
+
       // Subsequent begin/end pairs start a fresh frame list. Object records
       // stay so anything created before this save (and still referenced by
       // a later capture) is exported next time too.
@@ -1206,7 +1216,14 @@ export let webgpuInspector = null;
               querySet: this._timestampQuerySet,
               beginningOfPassWriteIndex: this._timestampIndex,
               endOfPassWriteIndex: this._timestampIndex + 1
-            } };
+            },
+            // Record which slot of *our* query set this pass owns. Injection is
+            // skipped for passes that already carry the page's own
+            // timestampWrites, so pass order and query order do not match --
+            // the consumer must map by this index, not by position. Unknown
+            // dictionary members are ignored by WebIDL conversion, so this is
+            // inert as far as the descriptor is concerned.
+            __wgpuInspectorTimestampIndex: this._timestampIndex };
             this._timestampIndex += 2;
           }
         }
@@ -1292,6 +1309,14 @@ export let webgpuInspector = null;
           commandEncoder.copyBufferToBuffer(this._timestampBuffer, 0, timestampDstBuffer, 0, this._timestampIndex * 8);
           object.__device.queue.submit([commandEncoder.finish()]);
           this._timestampIndex = 0;
+          // Register the readback synchronously, here, rather than when
+          // `_sendTimestampBuffer` finally runs inside the onSubmittedWorkDone
+          // callback below. `saveCaptureData` waits on `_pendingMapCount`, and
+          // with `payloads: "none"` there are no other readbacks keeping the
+          // counter above zero -- the wait would return before the timestamp
+          // map was even registered and the capture would export with no
+          // per-pass timings at all.
+          this._pendingMapCount++;
         }
 
         const self = this;
@@ -2847,9 +2872,11 @@ export let webgpuInspector = null;
       }
     }
 
+    // `_pendingMapCount` was already incremented for this buffer at submit
+    // time (see the `method === "submit"` handler), so this only balances it
+    // back down -- on both the success and the failure path.
     _sendTimestampBuffer(count, buffer) {
       const self = this;
-      this._pendingMapCount++;
       buffer.mapAsync(GPUMapMode.READ).then(() => {
         self.disableRecording();
         const range = buffer.getMappedRange();
@@ -2860,6 +2887,10 @@ export let webgpuInspector = null;
         self._pendingMapFinished();
      }).catch((error) => {
         console.error(error);
+        // Balance the increment from submit so a failed map (destroyed device,
+        // lost buffer) doesn't stall `_waitForCapturedReadbacks` for its full
+        // 30s deadline.
+        self._pendingMapFinished();
       });
     }
 

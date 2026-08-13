@@ -77,6 +77,10 @@ export class LocalCaptureStore {
     // saveCaptureData()/importCaptureJson() round-trips.
     this._timestampBytes = null;
     this._timestampChunksRemaining = 0;
+    // Fully-assembled timestamp buffers, one per submit, in arrival order.
+    // Merged onto the command records lazily at serialization time -- see
+    // _mergeTimestamps().
+    this._pendingTimestamps = [];
   }
 
   hasCapturedCommands() {
@@ -93,6 +97,9 @@ export class LocalCaptureStore {
     this._currentSlot = null;
     this._firstFrame = null;
     this._pendingBufferData.clear();
+    this._timestampBytes = null;
+    this._timestampChunksRemaining = 0;
+    this._pendingTimestamps.length = 0;
   }
 
   // Clear just the captured commands (and the pending-by-id state that goes
@@ -106,6 +113,7 @@ export class LocalCaptureStore {
     this._pendingBufferData.clear();
     this._timestampBytes = null;
     this._timestampChunksRemaining = 0;
+    this._pendingTimestamps.length = 0;
   }
 
   processMessage(message) {
@@ -306,11 +314,12 @@ export class LocalCaptureStore {
   }
 
   // Accumulates the raw u64 timestamp buffer streamed in CaptureBufferData
-  // messages with commandId === -1000. When the last chunk arrives, decodes the
-  // BigInt64Array and writes startTime/endTime/duration onto each
-  // beginRenderPass/beginComputePass command in capture order. Mirrors the
-  // decode in src/devtools/capture_data.js so the merged fields are picked up
-  // unchanged by _serializeCommand → saveCaptureData → importCaptureJson.
+  // messages with commandId === -1000. One such buffer arrives per submit,
+  // covering only that submit's passes (the page side resets its query index
+  // every submit). Completed buffers are queued rather than merged on the
+  // spot: the chunks can outrun the CaptureFrameCommands batches they describe,
+  // so the merge happens once, at serialization time, when every command record
+  // is known. See _mergeTimestamps().
   _handleTimestampChunk(message) {
     if (this._timestampBytes === null) {
       this._timestampBytes = new Uint8Array(message.size);
@@ -322,28 +331,65 @@ export class LocalCaptureStore {
     } catch (e) {
       return;
     }
+    if (message.offset + chunk.length > this._timestampBytes.length) {
+      // Mismatched buffer sizing (a stale chunk from a previous capture);
+      // drop the partial assembly rather than corrupting it.
+      this._timestampBytes = null;
+      this._timestampChunksRemaining = 0;
+      return;
+    }
     this._timestampBytes.set(chunk, message.offset);
     this._timestampChunksRemaining--;
     if (this._timestampChunksRemaining > 0) {
       return;
     }
 
-    const timestampData = new BigInt64Array(this._timestampBytes.buffer);
+    this._pendingTimestamps.push(new BigInt64Array(this._timestampBytes.buffer));
     this._timestampBytes = null;
+    this._timestampChunksRemaining = 0;
+  }
 
-    let i = 2;
-    for (let k = 0; k < this._commands.length && i < timestampData.length; k++) {
-      const command = this._commands[k];
-      if (!command || (command.method !== "beginRenderPass" && command.method !== "beginComputePass")) {
+  // Writes startTime/endTime/duration onto each beginRenderPass /
+  // beginComputePass command from the queued per-submit timestamp buffers.
+  //
+  // Passes are NOT matched positionally: the page side skips injection for any
+  // pass that already carries the application's own timestampWrites, so a
+  // frame can mix inspector-timed and app-timed passes in any order. Each
+  // injected pass instead carries __wgpuInspectorTimestampIndex, its slot in
+  // the inspector's query set. That index resets to 0 on every submit and each
+  // queued buffer covers exactly one submit, so a non-increasing index means
+  // the next buffer has started.
+  _mergeTimestamps() {
+    if (!this._pendingTimestamps.length) {
+      return;
+    }
+    let submit = 0;
+    let lastIndex = -1;
+    for (const command of this._commands) {
+      if (!command ||
+          (command.method !== "beginRenderPass" && command.method !== "beginComputePass")) {
         continue;
       }
-      const start = timestampData[i];
-      const end = timestampData[i + 1];
+      const descriptor = command.args && command.args[0];
+      const index = descriptor && descriptor.__wgpuInspectorTimestampIndex;
+      if (typeof index !== "number") {
+        continue; // app-owned timestampWrites, or injection was capped/skipped
+      }
+      if (index <= lastIndex) {
+        submit++;
+      }
+      lastIndex = index;
+      const timestampData = this._pendingTimestamps[submit];
+      if (!timestampData || index + 1 >= timestampData.length) {
+        continue;
+      }
+      const start = timestampData[index];
+      const end = timestampData[index + 1];
       command.startTime = Number(start) / 1000000.0;
       command.endTime = Number(end) / 1000000.0;
       command.duration = Number(end - start) / 1000000.0;
-      i += 2;
     }
+    this._pendingTimestamps.length = 0;
   }
 
   _handleCaptureTextureData(message) {
@@ -381,6 +427,9 @@ export class LocalCaptureStore {
   // `{ metadata, payloads }`; the caller streams them (NDJSON: metadata first,
   // then one line per payload) so no single huge string is ever allocated.
   buildCaptureStream(toolVersion) {
+    // Fold in any GPU timings that arrived out of band before serializing.
+    this._mergeTimestamps();
+
     const collector = new PayloadCollector();
 
     const objects = {};
