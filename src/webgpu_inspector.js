@@ -22,6 +22,13 @@ export let webgpuInspector = null;
   const _postMessage = self.postMessage;
   const _dispatchEvent = self.dispatchEvent;
 
+  // Whether the browser extension is present to receive messages. Its loader installs
+  // __webgpu_src before running this script (and the Worker proxy propagates it into
+  // injected workers). Manual <script> injection and the Claude Code plugin's CDP
+  // injection never set it: there, messages only feed the local capture store, and
+  // the heavy binary payload chunks can skip base64 encoding and dispatch entirely.
+  const _hasExtension = typeof _self.__webgpu_src === "function";
+
   const webgpuInspectorCaptureFrameKey = "WEBGPU_INSPECTOR_CAPTURE_FRAME";
 
   // How much data should we send to the panel via message as a chunk. Each chunk becomes its
@@ -51,6 +58,9 @@ export let webgpuInspector = null;
   const maxTextureCaptureSize = 16 * 1024 * 1024; // 16MB
   const maxColorAttachments = 10;
   const captureFrameCount = 1;
+
+  // Resolved once: the type checks below run for every argument of every captured command.
+  const _SharedArrayBuffer = typeof SharedArrayBuffer === "function" ? SharedArrayBuffer : null;
 
   // Build a scoped-capture filter from capture options. Returns null when no
   // scoping is requested (capture everything). `passLabel` may be a string
@@ -83,20 +93,31 @@ export let webgpuInspector = null;
       this._captureFrameCommands = []; // Commands for the current frame that have been captured
       this._frameCaptureCommands = []; // Commands for all captured frames.
       this._commandId = 0;
-      this._frameData = [];
+      // Counter behind the `@<id> <Type> <bytes>` placeholders that stand in for large
+      // array arguments in captured commands (see _addCommandData). Only the ids are
+      // emitted; the arrays themselves are not retained.
+      this._commandDataCount = 0;
       this._frameRenderPassCount = 0; // Count of render passes in the current frame
       this._captureTexturedBuffers = [];
       this._currentFrame = null;
       this._frameIndex = 0; // The current frame index based on requestAnimationFrame
       this._gpuFrameIndex = 0; // The frame index based on frames that have GPU work submitted
-      this._frameGpuCommandCount = 0; // The number of GPU commands in the current frame
+      this._frameSubmitCount = 0; // queue.submit calls inside the current rAF callback
+      // rAF timestamps: the latest distinct one seen and the one before it. Every callback
+      // in a display frame shares a timestamp, and the page's rAF fires every vsync whether
+      // or not it renders, so consecutive distinct timestamps are consecutive vsyncs (unless
+      // the main thread was blocked, which is exactly what dropped-frame detection looks for).
+      this._rafTimestamp = 0;
+      this._previousRafTimestamp = 0;
+      this._rafFrameRendered = false; // a callback in the current display frame submitted
       this._initialized = true;
       this._objectID = 1;
       this._lastFrameTime = 0;
       this._captureFrameRequest = false;
       this._errorChecking = 1;
+      // See the bindGroupErrorScopes accessor. Off by default.
+      this._bindGroupErrorScopes = false;
       this._trackedObjects = new Map();
-      this._trackedObjectInfo = new Map();
       this._bindGroupCount = 0;
       this._captureTextureRequest = new Map();
       this._toDestroy = []; // Defer deleting temp objects until after finish
@@ -181,6 +202,15 @@ export let webgpuInspector = null;
       const self = this;
 
       this._statusElementsCreated = false;
+      // The status overlay is written at most once per frame, and only when its text
+      // changed. _updateStatusMessage / _updateFrameStatus are called from many hot spots
+      // (every captured setBindGroup / setVertexBuffer, every readback completion), so they
+      // only mark the overlay dirty and schedule a flush; _flushStatusOverlay does the DOM work.
+      this._statusDirty = false;
+      this._statusFlushScheduled = false;
+      this._lastFrameStatusText = "";
+      this._lastStatusText = "";
+      this._lastStatusTitle = "";
 
       if (_document) {
         this.scheduleStatusElements();
@@ -273,6 +303,7 @@ export let webgpuInspector = null;
       }
 
       this._gpuWrapper = new GPUObjectWrapper(this);
+      this._wrapLabelAccessors();
       // Recording where each GPU object was created costs a stacktrace capture
       // per creation (~16us, see stacktrace.js), so it is opt-in via the panel's
       // "Object Stacktraces" setting, forwarded here by the loader. A frame
@@ -288,14 +319,17 @@ export let webgpuInspector = null;
 
       this._garbageCollectectedObjects = [];
 
-      // Track garbage collected WebGPU objects
-      this._garbageCollectionRegistry = new FinalizationRegistry((id) => {
+      // Track garbage collected WebGPU objects. The held value is the object's id, or
+      // `{ id, ctor }` for the few classes the callback needs to know the class of
+      // (see _wrapObject). Explicitly destroyed objects are unregistered, so this
+      // only fires for objects that went away without destroy().
+      this._garbageCollectionRegistry = new FinalizationRegistry((held) => {
+        const id = typeof held === "number" ? held : held.id;
         if (id > 0) {
           // It's too slow to send a message for every object that gets garbage collected,
           // so we'll batch them up and send them every so often.
           self._garbageCollectectedObjects.push(id);
-          const objectClass = self._trackedObjectInfo.get(id);
-          //const object = self._trackedObjects.get(id)?.deref();
+          const objectClass = typeof held === "number" ? null : held.ctor;
 
           if (objectClass) {
             if (objectClass === GPUBindGroup) {
@@ -327,7 +361,6 @@ export let webgpuInspector = null;
 
         if (id > 0) {
           self._trackedObjects.delete(id);
-          self._trackedObjectInfo.delete(id);
           self._captureTextureRequest.delete(id);
           self._objectReplacementMap.delete(id);
         }
@@ -381,6 +414,10 @@ export let webgpuInspector = null;
       // Wrap requestAnimationFrame so it can keep track of framerates and frame captures.
       // This requires that the page uses requestAnimationFrame to drive the rendering loop.
       const __requestAnimationFrame = requestAnimationFrame;
+      // Kept for the inspector's own scheduling (status overlay flush) so it doesn't go
+      // through the wrapper below and get counted as a page frame. Bound to the global:
+      // calling a native function as a method of another object is an "Illegal invocation".
+      this._nativeRequestAnimationFrame = __requestAnimationFrame.bind(_self);
       this._currentFrameTime = 0.0;
 
       requestAnimationFrame = function (cb) {
@@ -555,6 +592,7 @@ export let webgpuInspector = null;
       this._inspectingStatusFrame = _document.createElement("div");
       this._inspectingStatusFrame.style = "display: inline-block; cursor: pointer;";
       this._inspectingStatusFrame.textContent = "Frame: 0";
+      this._lastFrameStatusText = "Frame: 0";
       statusContainer.appendChild(this._inspectingStatusFrame);
 
       this._inspectingStatusText = _document.createElement("div");
@@ -570,6 +608,9 @@ export let webgpuInspector = null;
           self._sendCapturedCommands();
         }
       });
+
+      // Show the current state right away rather than waiting for the next update.
+      this._updateStatusMessage();
     }
 
     ///  Disable recording of WebGPU calls.
@@ -620,6 +661,26 @@ export let webgpuInspector = null;
       if (this._gpuWrapper && (!this._captureFrameRequest || this._recordObjectStacktraces)) {
         this._gpuWrapper.recordStacktraces = this._recordObjectStacktraces;
       }
+    }
+
+    // Whether every createBindGroup is wrapped in its own validation error scope so
+    // a creation error can be attributed to the bind group's id in the panel.
+    //
+    // Off by default. Shader modules and pipelines keep per-object scopes (they are
+    // created rarely), but engines commonly create hundreds of bind groups per frame,
+    // and each scope costs two GPU-process commands plus a promise and closure for
+    // popErrorScope — measured at ~1.3us of the ~3.3us the inspector added per
+    // createBindGroup, and most of the frame-time jitter. Without the scope a bind
+    // group creation error still reaches the panel through the device's
+    // "uncapturederror" listener (with the descriptor label in Dawn's message text,
+    // but no object id), and the page's own uncapturederror handler sees it too.
+    //   webgpuInspector.bindGroupErrorScopes = true;
+    get bindGroupErrorScopes() {
+      return this._bindGroupErrorScopes;
+    }
+
+    set bindGroupErrorScopes(enabled) {
+      this._bindGroupErrorScopes = !!enabled;
     }
 
     // Opt-in live bridge mode for the WebGPU Inspector Claude Code plugin.
@@ -720,16 +781,7 @@ export let webgpuInspector = null;
         return;
       }
       const maxFrameCount = 2000;
-      let commands;
-      if (this._frameCaptureCommands.length === 1) {
-        commands = this._frameCaptureCommands[0];
-      } else {
-        commands = [];
-        for (const frameCommands of this._frameCaptureCommands) {
-          commands.push(...frameCommands);
-        }
-      }
-      this._frameCaptureCommands = [];
+      const commands = this._takeFrameCaptureCommands();
 
       const batches = Math.ceil(commands.length / maxFrameCount);
       this._postMessage({
@@ -740,29 +792,70 @@ export let webgpuInspector = null;
       });
       for (let i = 0; i < commands.length; i += maxFrameCount) {
         const length = Math.min(maxFrameCount, commands.length - i);
-        const commandsSlice = commands.slice(i, i + length);
+        const batch = this._encodeCommandBatch(commands.slice(i, i + length));
         this._postMessage({
           "action": Actions.CaptureFrameCommands,
           "frame": this._frameIndex,
-          "commands": commandsSlice,
+          "commands": batch.commands,
+          "stacktraces": batch.stacktraces,
           "index": i,
           "count": length
         });
       }
     }
 
+    // Wire form of one CaptureFrameCommands batch. Captured commands from the same
+    // call site share a stacktrace string (stacktrace.js already dedups them in
+    // memory), but serializing each record repeats the full text, and with per-command
+    // stacktraces on a frame of a few thousand commands that text dominates the
+    // payload. Each distinct stacktrace is sent once in a `stacktraces` table and the
+    // records carry its index instead. Records without a stacktrace pass through
+    // untouched, and a batch with no stacktraces at all is sent as-is with no table,
+    // so the common case copies nothing. Receivers (the panel's CaptureData and
+    // LocalCaptureStore) resolve the indices back to strings.
+    _encodeCommandBatch(commands) {
+      let hasStacktrace = false;
+      for (let i = 0; i < commands.length; ++i) {
+        const st = commands[i].stacktrace;
+        if (typeof st === "string" && st.length > 0) {
+          hasStacktrace = true;
+          break;
+        }
+      }
+      if (!hasStacktrace) {
+        return { commands, stacktraces: undefined };
+      }
+      const stacktraces = [];
+      const indexOf = new Map();
+      const out = new Array(commands.length);
+      for (let i = 0; i < commands.length; ++i) {
+        const cmd = commands[i];
+        const st = cmd.stacktrace;
+        if (typeof st === "string" && st.length > 0) {
+          let index = indexOf.get(st);
+          if (index === undefined) {
+            index = stacktraces.length;
+            stacktraces.push(st);
+            indexOf.set(st, index);
+          }
+          out[i] = { ...cmd, stacktrace: index };
+        } else {
+          out[i] = cmd;
+        }
+      }
+      return { commands: out, stacktraces };
+    }
+
     // Wait for all outstanding texture/buffer readbacks (`mapAsync`s
     // queued during `submit`) to complete and their data messages to land
     // in the store. Returns once `_pendingMapCount` settles at 0.
     async _waitForCapturedReadbacks() {
-      // Poll on rAF where available, otherwise setTimeout; ~16ms cadence.
-      const sleep = () => new Promise((resolve) => {
-        if (typeof requestAnimationFrame === "function") {
-          requestAnimationFrame(() => resolve());
-        } else {
-          setTimeout(resolve, 16);
-        }
-      });
+      // Poll on a timer, ~16ms cadence. Not requestAnimationFrame: the global is the
+      // inspector's own wrapper, so each poll tick used to run _frameStart/_frameEnd
+      // and advance the frame counter (and post DeltaTime) while nothing was being
+      // rendered. rAF also stops firing in a hidden tab, which would stall a
+      // saveCaptureData() driven from the plugin until the deadline below.
+      const sleep = () => new Promise((resolve) => setTimeout(resolve, 16));
       // Bound the wait so a stuck mapAsync (lost device, destroyed buffer)
       // doesn't hang `saveCaptureData()` forever.
       const deadline = Date.now() + 30000;
@@ -1032,14 +1125,7 @@ export let webgpuInspector = null;
 
     // Send a message to the devtools panel.
     _postMessage(message) {
-      message.__webgpuInspector = true;
-      message.__webgpuInspectorPage = true;
-      message.__webgpuInspectorWorker = !_window;
-
-      if (this._iframeOrigin !== null) {
-        message.__webgpuInspectorFrame = true;
-        message.__webgpuInspectorFrameOrigin = this._iframeOrigin;
-      }
+      this._tagMessage(message);
 
       // Feed the local capture store (manual-injection use case). Same
       // payload the devtools panel consumes, so the resulting JSON is
@@ -1049,6 +1135,41 @@ export let webgpuInspector = null;
         this._localCapture.processMessage(message);
       }
 
+      this._sendToPanel(message);
+    }
+
+    // Send a binary payload chunk (CaptureBufferData / CaptureTextureData). `bytes` is the
+    // chunk's raw data. The local store takes the bytes directly, copying them into its own
+    // buffer; only the extension's JSON-only message pipe needs the base64 string, so the
+    // ~1.33x encode (and a CustomEvent carrying a multi-megabyte string) is skipped when no
+    // extension is present — the plugin/bridge and manual-injection paths.
+    _postPayloadChunk(message, bytes) {
+      this._tagMessage(message);
+
+      if (this._localCapture) {
+        this._localCapture.processMessage({ ...message, chunk: bytes });
+      }
+
+      if (!_hasExtension) {
+        return;
+      }
+      message.chunk = encodeBase64(bytes);
+      this._sendToPanel(message);
+    }
+
+    _tagMessage(message) {
+      message.__webgpuInspector = true;
+      message.__webgpuInspectorPage = true;
+      message.__webgpuInspectorWorker = !_window;
+
+      if (this._iframeOrigin !== null) {
+        message.__webgpuInspectorFrame = true;
+        message.__webgpuInspectorFrameOrigin = this._iframeOrigin;
+      }
+    }
+
+    // Queue or dispatch a tagged message toward the devtools panel.
+    _sendToPanel(message) {
       // High-frequency notification? Queue it for coalescing instead of sending immediately.
       if (_batchableActions.has(message.action)) {
         this._pendingMessages.push(message);
@@ -1111,11 +1232,6 @@ export let webgpuInspector = null;
     // Called before a GPU method is called, allowing the inspector to modify
     // the arguments or the object before the method is called.
     _preMethodCall(object, method, args) {
-      // Don't include requestAdapter and requestDevice in the command count.
-      if (method !== "requestAdapter" && method !== "requestDevice") {
-        this._frameGpuCommandCount++;
-      }
-
       if (method === "destroy") {
         if (object === this._device?.deref()) {
           if (this._pendingMapCount) {
@@ -1183,7 +1299,7 @@ export let webgpuInspector = null;
       if (method === "createShaderModule" ||
           method === "createRenderPipeline" ||
           method === "createComputePipeline" ||
-          method === "createBindGroup") {
+          (method === "createBindGroup" && this._bindGroupErrorScopes)) {
         if (this._errorChecking > 0) {
           this._gpuWrapper.disableRecording();
           object.pushErrorScope("validation");
@@ -1293,6 +1409,7 @@ export let webgpuInspector = null;
       }
 
       if (method === "submit") {
+        this._frameSubmitCount++;
         this.disableRecording();
 
         let timestampDstBuffer = null;
@@ -1346,35 +1463,47 @@ export let webgpuInspector = null;
           });
         }
 
-        const captureBuffers = [...this._captureTempBuffers];
-        this._captureTempBuffers.length = 0;
+        // Only wait on the GPU when this submit actually has readbacks or temp objects to
+        // collect. That is the exception: most submits happen with no capture in flight, and
+        // onSubmittedWorkDone costs a GPU-process round trip plus a promise and closure per
+        // call, on every submit of every frame. Hand the arrays off rather than copying them
+        // so the common path allocates nothing.
+        const hasWork = this._captureTempBuffers.length > 0 ||
+          this._captureTexturedBuffers.length > 0 ||
+          this._toDestroy.length > 0 ||
+          timestampDstBuffer !== null;
 
-        const captureTextures = [...this._captureTexturedBuffers];
-        this._captureTexturedBuffers.length = 0;
+        if (hasWork) {
+          const captureBuffers = this._captureTempBuffers;
+          this._captureTempBuffers = [];
 
-        const toDestroy = [...this._toDestroy];
-        this._toDestroy.length = 0;
+          const captureTextures = this._captureTexturedBuffers;
+          this._captureTexturedBuffers = [];
 
-        this._pendingMapCount += captureBuffers.length + captureTextures.length;
+          const toDestroy = this._toDestroy;
+          this._toDestroy = [];
 
-        object.onSubmittedWorkDone().then( async () => {
-          self.disableRecording();
+          this._pendingMapCount += captureBuffers.length + captureTextures.length;
 
-          if (timestampDstBuffer) {
-            self._sendTimestampBuffer(timestampDstBuffer.__count, timestampDstBuffer);
-          }
+          object.onSubmittedWorkDone().then(() => {
+            self.disableRecording();
 
-          if (captureBuffers.length) {
-            self._sendCapturedBuffers(captureBuffers);
-          }
-          if (captureTextures.length) {
-            self._sendCaptureTextureBuffers(captureTextures);
-          }
-          for (const obj of toDestroy) {
-            obj.destroy();
-          }
-          self.enableRecording();
-        });
+            if (timestampDstBuffer) {
+              self._sendTimestampBuffer(timestampDstBuffer.__count, timestampDstBuffer);
+            }
+
+            if (captureBuffers.length) {
+              self._sendCapturedBuffers(captureBuffers);
+            }
+            if (captureTextures.length) {
+              self._sendCaptureTextureBuffers(captureTextures);
+            }
+            for (const obj of toDestroy) {
+              obj.destroy();
+            }
+            self.enableRecording();
+          });
+        }
 
         this.enableRecording();
       }
@@ -1382,7 +1511,7 @@ export let webgpuInspector = null;
       if (method === "createShaderModule" ||
           method === "createRenderPipeline" ||
           method === "createComputePipeline" ||
-          method === "createBindGroup") {
+          (method === "createBindGroup" && this._bindGroupErrorScopes)) {
         if (this._errorChecking > 0) {
           this.disableRecording();
           const self = this;
@@ -1542,7 +1671,33 @@ export let webgpuInspector = null;
         }
       } else if (result) {
         this._wrapObject(result, id);
+        if (method === "createRenderPipelineAsync" || method === "createComputePipelineAsync") {
+          this._retainPipelineReferences(result, args[0]);
+        }
         this._postMessage({ action: Actions.ResolveAsyncObject, id: result.__id });
+      }
+    }
+
+    // Attach pipeline layout and shader modules to the pipeline so they are kept alive for the
+    // lifetime of the pipeline. Otherwise the page dropping its own references to them would
+    // collect their wrappers, and the inspector would report them deleted while the pipeline
+    // using them is still listed.
+    _retainPipelineReferences(pipeline, descriptor) {
+      if (!pipeline || !descriptor) {
+        return;
+      }
+      // layout is the string "auto" rather than a GPUPipelineLayout for auto-layout pipelines.
+      if (descriptor.layout instanceof GPUPipelineLayout) {
+        pipeline.__pipelineLayout = descriptor.layout;
+      }
+      if (descriptor.vertex?.module) {
+        pipeline.__vertexModule = descriptor.vertex.module;
+      }
+      if (descriptor.fragment?.module) {
+        pipeline.__fragmentModule = descriptor.fragment.module;
+      }
+      if (descriptor.compute?.module) {
+        pipeline.__computeModule = descriptor.compute.module;
       }
     }
 
@@ -1651,15 +1806,13 @@ export let webgpuInspector = null;
     }
 
     _isArrayBuffer(obj) {
-      if (typeof SharedArrayBuffer === 'function') {
-        return obj && (obj instanceof ArrayBuffer || obj instanceof SharedArrayBuffer);
-      }
-      return obj && obj instanceof ArrayBuffer;
+      return !!obj && (obj instanceof ArrayBuffer ||
+        (_SharedArrayBuffer !== null && obj instanceof _SharedArrayBuffer));
     }
 
-    // Is the object a typed array?
+    // Is the object a typed array (or DataView), or an ArrayBuffer?
     _isTypedArray(obj) {
-      return obj && (obj instanceof ArrayBuffer || this._isArrayBuffer(obj.buffer));
+      return !!obj && (obj instanceof ArrayBuffer || ArrayBuffer.isView(obj));
     }
 
     // Is the object a regular array?
@@ -1950,10 +2103,50 @@ export let webgpuInspector = null;
       }
     }
 
-    // Update the status overlay message.
+    // Request a status overlay refresh. Cheap: sets a flag and schedules one flush for the
+    // next animation frame, so any number of calls within a frame produce one DOM write.
     _updateStatusMessage() {
       if (!this._inspectingStatusFrame) {
         return;
+      }
+      this._statusDirty = true;
+      this._scheduleStatusFlush();
+    }
+
+    _scheduleStatusFlush() {
+      if (this._statusFlushScheduled) {
+        return;
+      }
+      this._statusFlushScheduled = true;
+      const self = this;
+      const flush = () => {
+        self._statusFlushScheduled = false;
+        self._flushStatusOverlay();
+      };
+      if (typeof this._nativeRequestAnimationFrame === "function") {
+        this._nativeRequestAnimationFrame(flush);
+      } else {
+        setTimeout(flush, 16);
+      }
+    }
+
+    // Write the overlay text. Only touches the DOM for parts whose text actually changed,
+    // since assigning textContent replaces the text node and invalidates layout even when
+    // the string is identical.
+    _flushStatusOverlay() {
+      if (!this._inspectingStatusFrame || !this._statusDirty) {
+        return;
+      }
+      this._statusDirty = false;
+
+      let frameStatus = `Frame: ${this._frameIndex}`;
+      const frameRate = this._frameRate.average;
+      if (frameRate !== 0) {
+        frameStatus += ` : ${frameRate.toFixed(2)}ms`;
+      }
+      if (frameStatus !== this._lastFrameStatusText) {
+        this._lastFrameStatusText = frameStatus;
+        this._inspectingStatusFrame.textContent = frameStatus;
       }
 
       let status = "";
@@ -1978,14 +2171,20 @@ export let webgpuInspector = null;
         status = `Capturing: ${status} `;
       }
 
+      let title = "";
       if (this._captureFrameRequest) {
         status = `Recording (click to stop): ${status}`;
-        this._inspectingStatusText.title = "Click to stop recording";
-      } else {
-        this._inspectingStatusText.title = "";
+        title = "Click to stop recording";
       }
 
-      this._inspectingStatusText.textContent = status;
+      if (title !== this._lastStatusTitle) {
+        this._lastStatusTitle = title;
+        this._inspectingStatusText.title = title;
+      }
+      if (status !== this._lastStatusText) {
+        this._lastStatusText = status;
+        this._inspectingStatusText.textContent = status;
+      }
     }
 
     // Update the frame rate overlay. Called for DeltaTime messages forwarded from worker
@@ -2023,16 +2222,9 @@ export let webgpuInspector = null;
       };
     }
 
-    // Update the frame status overlay.
+    // Request a frame counter refresh; same coalescing as _updateStatusMessage.
     _updateFrameStatus() {
-      if (this._inspectingStatusFrame) {
-        let statusMessage = `Frame: ${this._frameIndex}`;
-        const frameRate = this._frameRate.average;
-        if (frameRate !== 0) {
-          statusMessage += ` : ${frameRate.toFixed(2)}ms`;
-        }
-        this._inspectingStatusFrame.textContent = statusMessage;
-      }
+      this._updateStatusMessage();
     }
 
     // Begin capturing frame data based on the settings passed in _captureData from the devtools panel.
@@ -2093,38 +2285,21 @@ export let webgpuInspector = null;
       return sorted[Math.floor(len * 0.2)];
     }
 
-    // Called at the start of each frame, before the requestAnimationFrame callback is invoked.
+    // Called before every requestAnimationFrame callback the page registered. A page
+    // commonly has several per frame (an engine loop plus a UI or stats loop), so this
+    // only prepares per-callback state; frame timing and the frame counter are handled
+    // in _frameEnd, and only for callbacks that submitted GPU work.
     _frameStart(time) {
-      this._frameGpuCommandCount = 0;
+      this._frameSubmitCount = 0;
       // Wall-clock at the top of the app's frame callback. _frameEnd subtracts this to
       // get main-thread submit time (CPU cost of building + issuing the frame's work).
       this._frameCpuStart = performance.now();
 
-      let deltaTime = 0;
-      if (this._lastFrameTime == 0) {
-        this._lastFrameTime = time;
-      } else {
-        deltaTime = time - this._lastFrameTime;
-        this._lastFrameTime = time;
-        this._frameRate.add(deltaTime);
-
-        // rAF fires once per vsync, so a kept frame lands ~1 refresh period apart and each
-        // extra whole period is a dropped frame. The refresh period is estimated as a low
-        // percentile of a sliding window of recent deltas (see _estimateRefreshPeriod) —
-        // NOT the all-time minimum, which a single sub-period frame (a VRR display, an
-        // early light frame) would poison permanently, making every later frame read as a
-        // drop. The 2ms floor ignores double-fired rAFs that share a timestamp.
-        let skipped = 0;
-        if (deltaTime > 2) {
-          this._recordFrameDelta(deltaTime);
-          if (this._refreshPeriod > 0) {
-            skipped = Math.max(0, Math.round(deltaTime / this._refreshPeriod) - 1);
-            this._skippedFrameTotal += skipped;
-          }
-        }
-
-        this._postMessage({ "action": Actions.DeltaTime, deltaTime, skipped,
-          "refresh": this._refreshPeriod, "cpuTime": this._lastCpuTime });
+      if (time !== this._rafTimestamp) {
+        // First callback of a new display frame.
+        this._previousRafTimestamp = this._rafTimestamp;
+        this._rafTimestamp = time;
+        this._rafFrameRendered = false;
       }
 
       if (_sessionStorage) {
@@ -2145,43 +2320,54 @@ export let webgpuInspector = null;
       }
 
       if (this._captureFrameCount <= 0) {
-        this._frameData.length = 0;
+        this._commandDataCount = 0;
         this._captureFrameCommands.length = 0;
         this._frameRenderPassCount = 0;
-        this._frameIndex++;
       }
+    }
 
-      if (this._inspectingStatusFrame) {
-        this._updateFrameStatus();
-        this._updateStatusMessage();
+    // Hand off the captured frames' command lists as one flat array and reset the
+    // per-frame list. Concatenated with a plain loop: `push(...frameCommands)` passes
+    // every command as a call argument, and a large frame (tens of thousands of
+    // commands) can exceed the engine's argument limit and throw a RangeError,
+    // losing the capture.
+    _takeFrameCaptureCommands() {
+      const frames = this._frameCaptureCommands;
+      this._frameCaptureCommands = [];
+      if (frames.length === 1) {
+        return frames[0];
       }
+      let total = 0;
+      for (let i = 0; i < frames.length; ++i) {
+        total += frames[i].length;
+      }
+      const commands = new Array(total);
+      let n = 0;
+      for (let i = 0; i < frames.length; ++i) {
+        const frameCommands = frames[i];
+        for (let j = 0; j < frameCommands.length; ++j) {
+          commands[n++] = frameCommands[j];
+        }
+      }
+      return commands;
     }
 
     // Send all captured frame commands to the devtools panel.
     _sendCapturedCommands() {
       const maxFrameCount = 2000;
-
-      let commands = null;
-      if (this._frameCaptureCommands.length === 1) {
-        commands = this._frameCaptureCommands[0];
-      } else {
-        commands = [];
-        for (const frameCommands of this._frameCaptureCommands) {
-          commands.push(...frameCommands);
-        }
-      }
-      this._frameCaptureCommands = [];
+      const commands = this._takeFrameCaptureCommands();
 
       const batches = Math.ceil(commands.length / maxFrameCount);
       this._postMessage({ "action": Actions.CaptureFrameResults, "frame": this._frameIndex, "count": commands.length, "batches": batches });
 
       for (let i = 0; i < commands.length; i += maxFrameCount) {
         const length = Math.min(maxFrameCount, commands.length - i);
-        const commandsSlice = commands.slice(i, i + length);
+        const batch = this._encodeCommandBatch(commands.slice(i, i + length));
         this._postMessage({
             "action": Actions.CaptureFrameCommands,
             "frame": this._frameIndex - 1,
-            "commands": commandsSlice,
+            "commands": batch.commands,
+            "stacktraces": batch.stacktraces,
             "index": i,
             "count": length
           });
@@ -2193,29 +2379,79 @@ export let webgpuInspector = null;
       this._updateStatusMessage();
     }
 
-    // Called at the end of each frame, after the requestAnimationFrame callback have been invoked.
+    // Called after each requestAnimationFrame callback has returned (or, if it returned a
+    // Promise, resolved). A callback counts as a rendered frame only if it submitted GPU
+    // work: a UI/stats loop that never submits neither contributes a frame-time sample
+    // nor closes a captured frame — its commands (e.g. a bind group it created) fold into
+    // the frame of the callback that does render. Callbacks that share a rAF timestamp are
+    // the same display frame, so only the first submitting one is timed.
+    //
+    // The frame-time sample is the interval since the previous rAF tick, not since the
+    // previous *rendered* frame. A page that renders on demand (or throttles itself) runs
+    // its rAF callback every vsync and only sometimes submits; the vsyncs it idled through
+    // are not dropped frames and shouldn't read as one huge frame. What does show up is a
+    // callback that blocked the main thread across several vsyncs: rAF can't fire while it
+    // runs, so the tick interval grows and the excess periods count as dropped.
     _frameEnd(time) {
       // Main-thread time inside the app's frame callback (build + submit). On the
       // async-callback path (cb returns a Promise) this includes awaited time, so read
-      // it as callback wall time. Stashed for the next frame's DeltaTime message.
-      if (this._frameCpuStart) {
-        this._lastCpuTime = performance.now() - this._frameCpuStart;
+      // it as callback wall time.
+      const cpuTime = this._frameCpuStart ? performance.now() - this._frameCpuStart : 0;
+      const rendered = this._frameSubmitCount > 0;
+      if (!rendered) {
+        this._updateStatusMessage();
+        return;
       }
-      if (this._frameGpuCommandCount > 0) {
-        this._gpuFrameIndex++;
-        this._frameGpuCommandCount = 0;
-      }
+      this._frameSubmitCount = 0;
+      this._lastCpuTime = cpuTime;
 
-      // If we're captureing frames, and some commands have been recorded, send them to the devtools panel.
-      if (this._captureFrameCommands.length) {
-        this._frameCaptureCommands.push(this._captureFrameCommands);
-        if (this._captureFrameCommands.length === 1) {
-          if (this._captureFrameCommands[0].method === "requestAdapter" ||
-              this._captureFrameCommands[0].method === "requestDevice") {
-            // Don't count requestAdapter and requestDevice as frames.
-            this._captureFrameCount++;
+      if (!this._rafFrameRendered) {
+        this._rafFrameRendered = true;
+        let deltaTime = 0;
+        if (time === this._rafTimestamp) {
+          deltaTime = time - this._previousRafTimestamp;
+        } else if (this._lastFrameTime !== 0) {
+          // An async callback from an earlier frame resolving after a newer frame started;
+          // fall back to the interval between rendered frames.
+          deltaTime = time - this._lastFrameTime;
+        }
+        if (this._previousRafTimestamp !== 0 && deltaTime > 0) {
+          this._frameRate.add(deltaTime);
+
+          // A kept frame lands ~1 refresh period after the previous tick and each extra
+          // whole period is a dropped frame. The refresh period is estimated as a low
+          // percentile of a sliding window of recent deltas (see _estimateRefreshPeriod) —
+          // NOT the all-time minimum, which a single sub-period frame (a VRR display, an
+          // early light frame) would poison permanently, making every later frame read as a
+          // drop. The 2ms floor guards against near-duplicate timestamps.
+          let skipped = 0;
+          if (deltaTime > 2) {
+            this._recordFrameDelta(deltaTime);
+            if (this._refreshPeriod > 0) {
+              skipped = Math.max(0, Math.round(deltaTime / this._refreshPeriod) - 1);
+              this._skippedFrameTotal += skipped;
+            }
+          }
+
+          this._postMessage({ "action": Actions.DeltaTime, deltaTime, skipped,
+            "refresh": this._refreshPeriod, cpuTime });
+
+          // Frame numbering is frozen while a capture is in progress (the capture's
+          // frame number refers to the frame it started on).
+          if (this._captureFrameCount <= 0) {
+            this._frameIndex++;
           }
         }
+        this._lastFrameTime = time;
+        this._gpuFrameIndex++;
+        if (this._inspectingStatusFrame) {
+          this._updateFrameStatus();
+        }
+      }
+
+      // If we're capturing frames, and some commands have been recorded, send them to the devtools panel.
+      if (this._captureFrameCommands.length) {
+        this._frameCaptureCommands.push(this._captureFrameCommands);
         this._captureFrameCommands = [];
         this._captureFrameCount--;
         // If we're capturing multiple frames, wait until all frames have been captured.
@@ -2229,7 +2465,6 @@ export let webgpuInspector = null;
 
     _trackObject(id, object) {
       this._trackedObjects.set(id, new WeakRef(object));
-      this._trackedObjectInfo.set(id, object.constructor);
     }
 
     // Register an object that live shader editing may later swap out (shader
@@ -2274,34 +2509,70 @@ export let webgpuInspector = null;
 
       Object.defineProperty(object, "__id", { value: id ?? this.getNextId(object), enumerable: false, writable: true });
 
-      // Track garbage collected objects
-      this._garbageCollectionRegistry.register(object, object.__id);
+      // Track garbage collected objects. The finalizer needs the class only for the
+      // types that warn about leaks or are counted, so only those carry it; every other
+      // object holds just its id. This replaced a second per-object Map (id -> class)
+      // that existed only to serve the finalizer. The object is its own unregister
+      // token so destroy() can drop the registration.
+      const objectId = object.__id;
+      const ctor = object.constructor;
+      const held = (ctor === GPUBuffer || ctor === GPUTexture || ctor === GPUDevice || ctor === GPUBindGroup)
+        ? { id: objectId, ctor }
+        : objectId;
+      this._garbageCollectionRegistry.register(object, held, object);
 
-      if (object.label !== undefined) {
-        // Capture chaning of the GPUObjectBase label
-        const l = object.label;
-        object._label = l;
-        const self = this;
-        Object.defineProperty(object, "label", {
-         enumerable: true,
-          configurable: true,
-          get() {
-            return this._label;
-          },
-          set(label) {
-            if (label !== this._label) {
-              this._label = label;
-              const id = this.__id;
-              self._postMessage({ "action": Actions.ObjectSetLabel, id, label });
-            }
-          }
-        });
-      }
+      // Label changes are observed by the prototype accessors installed in
+      // _wrapLabelAccessors, so nothing per-object is needed here.
 
       if (object instanceof GPUDevice) {
         // Automatically wrap the device's queue
         if (object.queue.__id === undefined) {
           this._wrapObject(object.queue);
+        }
+      }
+    }
+
+    // Observe GPUObjectBase.label changes so the panel can show the current label.
+    // Done once per GPU interface prototype rather than per object: the previous
+    // per-instance accessor cost a defineProperty and two closure allocations for
+    // every wrapped object, which on a page creating views or bind groups each
+    // frame was a measurable share of the inspector's per-object overhead. The
+    // native accessor keeps storing the value; the setter only adds a
+    // notification for objects the inspector has assigned an id to.
+    _wrapLabelAccessors() {
+      const self = this;
+      for (const type of GPUObjectTypes) {
+        const proto = type?.prototype;
+        if (!proto) {
+          continue;
+        }
+        const desc = Object.getOwnPropertyDescriptor(proto, "label");
+        if (!desc || typeof desc.get !== "function" || typeof desc.set !== "function") {
+          continue; // No label on this interface (GPUAdapter, GPUCanvasContext).
+        }
+        const nativeGet = desc.get;
+        const nativeSet = desc.set;
+        try {
+          Object.defineProperty(proto, "label", {
+            enumerable: desc.enumerable,
+            configurable: true,
+            get: nativeGet,
+            set(label) {
+              const id = this.__id;
+              if (id === undefined) {
+                nativeSet.call(this, label);
+                return;
+              }
+              const previous = nativeGet.call(this);
+              nativeSet.call(this, label);
+              const current = nativeGet.call(this);
+              if (current !== previous) {
+                self._postMessage({ "action": Actions.ObjectSetLabel, id, "label": current });
+              }
+            }
+          });
+        } catch (e) {
+          // Non-configurable in this runtime; labels set after creation just won't be reported.
         }
       }
     }
@@ -2353,7 +2624,6 @@ export let webgpuInspector = null;
         // These are frequently created and destroyed via getCurrentTexture.
         if (id > 0) {
           this._trackedObjects.delete(id);
-          this._trackedObjectInfo.delete(id);
           this._objectReplacementMap.delete(id);
         }
         if (object instanceof GPUBindGroup) {
@@ -2380,8 +2650,11 @@ export let webgpuInspector = null;
         // These are frequently created and destroyed via getCurrentTexture.
         if (id > 0) {
           this._trackedObjects.delete(id);
-          this._trackedObjectInfo.delete(id);
           this._objectReplacementMap.delete(id);
+          // Explicitly destroyed: the maps are cleaned up here and DeleteObject is sent
+          // below, so the finalizer has nothing left to do (and must not emit a leak
+          // warning) when the JS wrapper is eventually collected.
+          this._garbageCollectionRegistry.unregister(object);
           // Drop the object's own copy of the record too, so a destroyed object
           // stops resolving to a replacement exactly as it did back when the hot
           // paths looked the record up in the map.
@@ -2469,27 +2742,21 @@ export let webgpuInspector = null;
         this._sendAddObjectMessage(id, parent, "BindGroupLayout", this._stringifyDescriptor(args[0]), stacktrace);
       } else if (method === "createPipelineLayout") {
         const id = result.__id;
+        // Hang on to the descriptor so the bind group layouts it references stay alive as long
+        // as the pipeline layout does.
+        Object.defineProperty(result, "__descriptor", { value: args[0], enumerable: false, writable: true });
         this._sendAddObjectMessage(id, parent, "PipelineLayout", this._stringifyDescriptor(args[0]), stacktrace);
       } else if (method === "createRenderPipeline") {
         const id = result.__id;
         if (!args[0].__replacement) {
           this._sendAddObjectMessage(id, parent, "RenderPipeline", this._stringifyDescriptor(args[0]), stacktrace);
-          // There are cases when the shader modules used by the render pipeline will be garbage collected, and we won't be able to inspect them after that.
-          // Hang on to the shader modules used in the descriptor by attaching them to the pipeline.
-          if (args[0].vertex?.module) {
-            result.__vertexModule = args[0].vertex?.module;
-          }
-          if (args[0].fragment?.module) {
-            result.__fragmentModule = args[0].fragment?.module;
-          }
+          this._retainPipelineReferences(result, args[0]);
         }
       } else if (method === "createComputePipeline") {
         const id = result.__id;
         if (!args[0].__replacement) {
           this._sendAddObjectMessage(id, parent, "ComputePipeline", this._stringifyDescriptor(args[0]), stacktrace);
-          if (args[0].compute?.module) {
-            result.__computeModule = args[0].compute?.module;
-          }
+          this._retainPipelineReferences(result, args[0]);
         }
       } else if (method === "createCommandEncoder") {
         // We'll need the CommandEncoder's device for capturing textures
@@ -2680,15 +2947,12 @@ export let webgpuInspector = null;
           const captureTextureView = attachment.resolveTarget ?? attachment.view;
           result.__captureRenderPassTextures.add(captureTextureView);
         }
-        this._inComputePass = false;
         result.__commandEncoder = object;
       } else if (method === "beginComputePass") {
         result.__commandEncoder = object;
         result.__passType = "compute";
         result.__passLabel = args[0]?.label || "";
-        this._inComputePass = true;
       } else if (method === "end") {
-        this._inComputePass = false;
         const commandEncoder = object.__commandEncoder;
         // Scoped capture: when a pass is filtered out, skip its heavy texture
         // payloads too. Buffer payloads were already gated at queue time.
@@ -2769,13 +3033,16 @@ export let webgpuInspector = null;
           self._mappedTextureBufferCount--;
           self._updateStatusMessage();
           self.disableRecording();
-          const range = tempBuffer.getMappedRange();
-          let data = new Uint8Array(range);
-          if (format === "stencil8") {
-            data = self._stencilBufferToFloatData(data, width, height, depthOrArrayLayers);
-          }
-          // Own the data so we can destroy the temp buffer before encoding chunks.
-          const owned = new Uint8Array(data).slice();
+          const mapped = new Uint8Array(tempBuffer.getMappedRange());
+          // Own the data so the temp buffer can be destroyed before the chunks are
+          // encoded. The stencil conversion already writes into a fresh array, so it
+          // needs no further copy; everything else takes exactly one copy out of the
+          // mapped range. (This used to be two copies for every texture — the typed
+          // array constructor copies, and then slice() copied again — and three for
+          // stencil textures.)
+          const owned = format === "stencil8"
+            ? self._stencilBufferToFloatData(mapped, width, height, depthOrArrayLayers)
+            : mapped.slice();
           tempBuffer.destroy();
           self._sendTextureData(id, passId, owned, mipLevel);
           self.enableRecording();
@@ -2817,7 +3084,7 @@ export let webgpuInspector = null;
         const offset = i * maxDataChunkSize;
         const chunkSize = Math.min(maxDataChunkSize, size - offset);
         const chunk = data.subarray(offset, offset + chunkSize);
-        this._postMessage({
+        this._postPayloadChunk({
           "action": Actions.CaptureTextureData,
           id,
           passId,
@@ -2825,9 +3092,8 @@ export let webgpuInspector = null;
           offset,
           size,
           index: i,
-          count: numChunks,
-          chunk: encodeBase64(chunk)
-        });
+          count: numChunks
+        }, chunk);
       }
     }
 
@@ -2858,7 +3124,7 @@ export let webgpuInspector = null;
         // encodeBase64 reads bytes synchronously into a fresh string, so the chunk view's
         // lifetime is bounded by this call.
         const chunk = data.subarray(offset, offset + chunkSize);
-        this._postMessage({
+        this._postPayloadChunk({
           "action": Actions.CaptureBufferData,
           commandId,
           entryIndex,
@@ -2866,9 +3132,8 @@ export let webgpuInspector = null;
           size,
           originalSize: originalSize || 0,
           index: i,
-          count: numChunks,
-          chunk: encodeBase64(chunk)
-        });
+          count: numChunks
+        }, chunk);
       }
     }
 
@@ -3285,11 +3550,14 @@ export let webgpuInspector = null;
       }
     }
 
+    // Assign an id to a large array argument for its `@<id> <Type> <bytes>` placeholder.
+    // Nothing is stored: the previous implementation kept every such array in a
+    // per-frame list that was never read, pinning the page's typed arrays for the
+    // duration of a capture. Consumers of the placeholder only read the type and
+    // byte length.
     _addCommandData(data) {
       if (this._captureFrameRequest) {
-        const id = this._frameData.length;
-        this._frameData.push(data);
-        return id;
+        return this._commandDataCount++;
       }
       return -1;
     }
@@ -3324,8 +3592,11 @@ export let webgpuInspector = null;
           const id = this._addCommandData(object);
           return `@${id} ${object.constructor.name} ${object.byteLength}`;
         }
-        const newArray = [];
-        for (const i in object) {
+        // Indexed loop, not for...in: for...in materializes a string key per element and
+        // walks the prototype chain, and this runs for every captured command's arguments.
+        const length = object.length || 0;
+        const newArray = new Array(length);
+        for (let i = 0; i < length; ++i) {
           newArray[i] = this._processCommandArgs(object[i]);
         }
         return newArray;
@@ -3522,14 +3793,24 @@ __wgiQueuedMessages.length = 0;`;
       const backing = new target(...args);
       backing.__webgpuInspector = true;
 
-      window.addEventListener("__WebGPUInspector", (event) => {
-        // Forward messages from the page to the worker, if the worker hasn't been terminated,
-        // the message is from the inspector, and the message is not from the worker.
-        if (backing.__webgpuInspector && event.detail.__webgpuInspector &&
-          !event.detail.__webgpuInspectorPage) {
-          backing.postMessage({ __WebGPUInspector: event.detail });
-       }
-      });
+      // Forward inspector messages from the page to the worker. The listener holds the
+      // worker only weakly and unregisters itself once the worker is terminated or
+      // collected; a strong reference here would pin every Worker the page ever created
+      // (and this closure) to the window for the life of the page.
+      const backingRef = new WeakRef(backing);
+      const forwardToWorker = (event) => {
+        const worker = backingRef.deref();
+        if (worker === undefined || !worker.__webgpuInspector) {
+          window.removeEventListener("__WebGPUInspector", forwardToWorker);
+          return;
+        }
+        // Only forward messages from the inspector that did not come from a worker.
+        const detail = event.detail;
+        if (detail.__webgpuInspector && !detail.__webgpuInspectorPage) {
+          worker.postMessage({ __WebGPUInspector: detail });
+        }
+      };
+      window.addEventListener("__WebGPUInspector", forwardToWorker);
 
       backing.addEventListener("message", (event) => {
         let message = event.data;
@@ -3543,40 +3824,78 @@ __wgiQueuedMessages.length = 0;`;
         }
       });
 
+      // The proxy's get trap runs on every property access (worker.postMessage(...) is
+      // one per call), so anything it hands out is created once per worker and reused
+      // rather than re-bound on each access.
+      const boundMethods = new Map();
+
+      // The page's "message" handlers are wrapped to hide the inspector's own traffic.
+      // Remember each wrapper so removeEventListener(handler) still finds the listener
+      // that was actually registered.
+      const handlerWrappers = new WeakMap();
+      const wrapMessageHandler = (handler) => {
+        if (typeof handler !== "function") {
+          return handler;
+        }
+        let wrapper = handlerWrappers.get(handler);
+        if (wrapper === undefined) {
+          wrapper = function (event) {
+            const data = event.data;
+            if (!data || (!data.__webgpuInspector && !data.__WebGPUInspector)) {
+              return handler.call(this, event);
+            }
+          };
+          handlerWrappers.set(handler, wrapper);
+        }
+        return wrapper;
+      };
+
+      const addEventListener = function (type, handler, ...rest) {
+        if (type === "message") {
+          handler = wrapMessageHandler(handler);
+        }
+        return backing.addEventListener(type, handler, ...rest);
+      };
+
+      const removeEventListener = function (type, handler, ...rest) {
+        if (type === "message") {
+          handler = handlerWrappers.get(handler) ?? handler;
+        }
+        return backing.removeEventListener(type, handler, ...rest);
+      };
+
+      // Mark the worker terminated so no further inspector messages are forwarded to it,
+      // and drop the page-side forwarding listener right away.
+      const terminate = function (...args) {
+        const result = backing.terminate(...args);
+        backing.__webgpuInspector = false;
+        window.removeEventListener("__WebGPUInspector", forwardToWorker);
+        return result;
+      };
+
       return new Proxy(backing, {
         get(target, prop, receiver) {
-          // Intercept event handlers to hide the inspectors messages
           if (prop === "addEventListener") {
-            return function (...args) {
-              if (args[0] === "message") {
-                const origHandler = args[1];
-                args[1] = function (...args) {
-                  if (!args[0].data.__webgpuInspector && !args[0].data.__WebGPUInspector) {
-                    origHandler(...args);
-                  }
-                };
-              }
-
-              return target.addEventListener(...args);
-            };
+            return addEventListener;
           }
-
-          // Intercept worker termination and remove it from list so we don't send
-          // messages to a terminated worker.
+          if (prop === "removeEventListener") {
+            return removeEventListener;
+          }
           if (prop === "terminate") {
-            return function (...args) {
-              const result = target.terminate(...args);
-              target.__webgpuInspector = false;
-              return result;
-            };
+            return terminate;
           }
 
           if (prop in target) {
-            if (typeof target[prop] === "function") {
-              return target[prop].bind(target);
-            } else {
-              return target[prop];
+            const value = target[prop];
+            if (typeof value === "function") {
+              let bound = boundMethods.get(prop);
+              if (bound === undefined) {
+                bound = value.bind(target);
+                boundMethods.set(prop, bound);
+              }
+              return bound;
             }
+            return value;
           }
         },
         set(target, prop, newValue, receiver) {

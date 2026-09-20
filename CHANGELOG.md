@@ -1,3 +1,12 @@
+## v1.7.0
+
+* Inspection optimizations to reduce overhead of inspecting a page.
+* Various Inspector panel UI updates.
+
+## v1.6.1
+
+* Fix issue with pipelines inccorectly being flagged as invalid.
+
 ## v1.6.0
 
 ### Inspector Panel
