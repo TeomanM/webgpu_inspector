@@ -385,11 +385,14 @@ await test("Bridge start() on a busy port falls back to an OS-assigned port", as
 
 // One CaptureBufferData message carrying a whole timestamp buffer (commandId
 // -1000). Pairs are [beginNs, endNs] per pass, in pass order.
+// Real GPU timestamps are never 0 (0 means unwritten), so offset the fixtures.
+const TIMESTAMP_BASE_NS = 1000000000n;
+
 function timestampMessage(pairsNs) {
   const values = new BigInt64Array(pairsNs.length * 2);
   for (let i = 0; i < pairsNs.length; ++i) {
-    values[i * 2] = BigInt(pairsNs[i][0]);
-    values[i * 2 + 1] = BigInt(pairsNs[i][1]);
+    values[i * 2] = TIMESTAMP_BASE_NS + BigInt(pairsNs[i][0]);
+    values[i * 2 + 1] = TIMESTAMP_BASE_NS + BigInt(pairsNs[i][1]);
   }
   const bytes = new Uint8Array(values.buffer);
   return {
