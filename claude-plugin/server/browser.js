@@ -85,7 +85,9 @@ export class BrowserController {
       defaultViewport: null,
       // GPU replays (runReplay) can run for minutes on a big frame.
       protocolTimeout: REPLAY_TIMEOUT_MS,
-      args: ["--no-first-run", "--no-default-browser-check"]
+      // Extra flags go through Puppeteer's args so it merges --enable-features /
+      // --disable-features with its own defaults instead of the last copy winning.
+      args: ["--no-first-run", "--no-default-browser-check", ...extraChromeArgs()]
     });
     this._mode = "launch";
     this._launched = true;
@@ -314,7 +316,9 @@ export class BrowserController {
       }
       let page = this._replayPage;
       if (!page || page.isClosed()) {
-        page = await this._browser.newPage();
+        // Open in the background: a foreground replay tab hides the inspected
+        // page, Chrome stops its rAF loop, and later captures come back empty.
+        page = await this._browser.newPage({ background: true });
         this._replayPage = page;
         await page.goto(hostUrl, { waitUntil: "load", timeout: 30000 });
         await page.waitForFunction(() => window.__webgpuInspectorReplayReady === true, { timeout: 30000 });
@@ -403,6 +407,18 @@ function isRealPage(url) {
     !url.startsWith("chrome://") &&
     !url.startsWith("devtools://") &&
     !url.startsWith("edge://");
+}
+
+// WEBGPU_BRIDGE_CHROME_ARGS: a JSON array of flags, or flags separated by whitespace.
+function extraChromeArgs() {
+  const raw = (process.env.WEBGPU_BRIDGE_CHROME_ARGS || "").trim();
+  if (!raw) {
+    return [];
+  }
+  if (raw.startsWith("[")) {
+    return JSON.parse(raw).map(String);
+  }
+  return raw.split(/\s+/);
 }
 
 function findChrome() {

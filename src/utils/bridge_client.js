@@ -304,11 +304,18 @@ export class BridgeClient {
       return origRaf(function (time) {
         if (client._framesRemaining > 0) {
           client._inspector.beginFrameCapture(client._captureOptions);
+          let captured = false;
           try {
             callback(time);
           } finally {
-            client._inspector.endFrameCapture();
-            client._onFrameCaptured();
+            captured = client._inspector.endFrameCapture();
+            // Pages often run several rAF loops (render + UI/stats). Only a
+            // callback that recorded GPU work counts as a captured frame;
+            // otherwise a UI loop that runs first would use up the request
+            // and the capture would come back empty.
+            if (captured) {
+              client._onFrameCaptured();
+            }
           }
         } else {
           callback(time);

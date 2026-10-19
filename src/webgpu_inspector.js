@@ -911,15 +911,17 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
     // Stop recording GPU commands and flush the captured commands to the
     // local store. Async texture/buffer readbacks finish in the background
     // and are picked up by `saveCaptureData()`.
+    // Returns true if any GPU commands were recorded between begin and end.
     endFrameCapture() {
       if (!this._localCapture || !this._localCaptureActive) {
-        return;
+        return false;
       }
       // Mirror the trailing portion of `_frameEnd` for the in-flight frame:
       // hand the command list to `_frameCaptureCommands` so the existing
       // `_sendCapturedCommands` shape (one CaptureFrameResults + N
       // CaptureFrameCommands batches) flows to the local store.
-      if (this._captureFrameCommands.length) {
+      const captured = this._captureFrameCommands.length > 0;
+      if (captured) {
         this._frameCaptureCommands.push(this._captureFrameCommands);
         this._captureFrameCommands = [];
       }
@@ -927,6 +929,7 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
       this._localCaptureActive = false;
       this._captureScope = null;
       this._flushLocalCapturedCommands();
+      return captured;
     }
 
     // Send accumulated commands to the local store without resetting
