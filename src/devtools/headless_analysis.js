@@ -594,9 +594,25 @@ export async function measureShaderCost(session, device, { commandIndex: index, 
   if (!result.ok) {
     throw new Error(result.reason);
   }
+  // Sanity check against the live frame: when the pass was profiled and this
+  // is its only item, the replay should land within ~2x of the pass time.
+  // Beyond that the replay isn't doing the frame's work (wrong inputs), and
+  // per-statement costs would mislead.
+  const notes = result.notes ?? [];
+  let reliable = !result.inputsIncomplete;
+  const liveMs = result.passDurationMs;
+  if (liveMs > 0 && result.passDispatchCount === 1 && result.totalMs > 0) {
+    const ratio = result.totalMs / liveMs;
+    if (ratio < 0.5 || ratio > 2) {
+      reliable = false;
+      notes.unshift(`UNRELIABLE: the replay took ${round(result.totalMs, 3)} ms but this pass took ${round(liveMs, 3)} ms in the captured frame (${round(ratio, 2)}x). The replay is likely not running the frame's workload, so the per-statement costs below should not be trusted.`);
+    }
+  }
   return {
     commandIndex: index,
     stage,
+    reliable,
+    liveMs: liveMs ?? undefined,
     totalMs: round(result.totalMs, 5),
     baselineMs: round(result.baselineMs, 5),
     repeats: result.repeats,
@@ -610,7 +626,7 @@ export async function measureShaderCost(session, device, { commandIndex: index, 
         tooSmall: (s.negative && s.depth === 0) || undefined,
       }))
       .sort((a, b) => (b.ms ?? -Infinity) - (a.ms ?? -Infinity)),
-    notes: result.notes ?? [],
+    notes,
   };
 }
 

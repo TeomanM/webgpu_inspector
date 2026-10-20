@@ -698,6 +698,16 @@ export async function measureStatementCosts({
 
         const attribution = attributeAblation(instrumented.cutPoints, measurements, instrumented.fullCut);
         const notes = Array.from(replay.notes).concat(attribution.notes);
+        // Inputs replayed without their captured contents change the work the
+        // shader does (early-outs, loop trip counts), so name them.
+        const inputWarnings = Array.from(missing);
+        for (const id of replay.placeholderTextures) {
+            const texture = replay.database.getObject(id);
+            inputWarnings.push(`${texture?.label || `Texture ${id}`}: no captured contents — it replays as zeros.`);
+        }
+        if (inputWarnings.length) {
+            notes.unshift(`Some inputs replayed without their captured data, so costs may not match the frame: ${inputWarnings.join(" ")}`);
+        }
         if (repeats > 1) {
             notes.push(`Each cut point was measured with the ${noun} encoded ${repeats} times and the total divided, because a single execution is below the GPU's timestamp granularity.`);
             if (isCompute) {
@@ -717,6 +727,9 @@ export async function measureStatementCosts({
             repeats,
             stage,
             notes,
+            inputsIncomplete: inputWarnings.length > 0,
+            passDurationMs: typeof pass.command?.duration === "number" ? pass.command.duration : null,
+            passDispatchCount: plans.length,
         };
     } catch (e) {
         return { ok: false, reason: `Ablation failed: ${e.message ?? e}`, notes: Array.from(replay.notes) };

@@ -26,6 +26,8 @@ const MAX_QUERIES_PER_SET = 4096;
 const TEXTURE_COPY_SRC = 0x01;
 const TEXTURE_TEXTURE_BINDING = 0x04;
 const TEXTURE_RENDER_ATTACHMENT = 0x10;
+const TEXTURE_COPY_DST = 0x02;
+const TEXTURE_STORAGE_BINDING = 0x08;
 
 const COUNT_FORMAT = "r16float";
 const F16_MAX = 65504;
@@ -193,20 +195,53 @@ export class CaptureReplay {
                 return texture.gpuTexture.object;
             }
             const gpuTexture = this.device.createTexture({
-                label: `overdraw stand-in for ${texture.label || `Texture ${id}`}`,
+                label: `replay stand-in for ${texture.label || `Texture ${id}`}`,
                 size: [texture.width, texture.height, texture.depthOrArrayLayers ?? 1],
                 dimension: desc.dimension ?? "2d",
                 format: desc.format,
                 mipLevelCount: desc.mipLevelCount ?? 1,
                 sampleCount: desc.sampleCount ?? 1,
-                usage: TEXTURE_TEXTURE_BINDING | TEXTURE_RENDER_ATTACHMENT | TEXTURE_COPY_SRC,
+                // Keep STORAGE_BINDING so a storage-texture binding still validates.
+                usage: ((desc.usage ?? 0) & TEXTURE_STORAGE_BINDING) |
+                    TEXTURE_TEXTURE_BINDING | TEXTURE_RENDER_ATTACHMENT | TEXTURE_COPY_SRC | TEXTURE_COPY_DST,
             });
             this._destroyables.push(gpuTexture);
-            // The caller decides whether this is worth a note: placeholder
-            // contents only matter when the vertex stage samples the texture.
-            this.placeholderTextures.add(id);
+            // Without the panel's GPU copy (a headless replay), seed the
+            // stand-in from the captured bytes so shaders sample real data.
+            if (isDepth || isMultisampled || !this._seedTexture(gpuTexture, texture)) {
+                // The caller decides whether this is worth a note.
+                this.placeholderTextures.add(id);
+            }
             return gpuTexture;
         });
+    }
+
+    // Upload a texture's captured mips. True only when every mip had bytes.
+    _seedTexture(gpuTexture, texture) {
+        const mipCount = texture.descriptor?.mipLevelCount ?? 1;
+        if (!Array.isArray(texture.imageData) || typeof texture.getMipSize !== "function" ||
+            /^(bc|etc2|eac|astc)/.test(texture.descriptor?.format ?? "")) {
+            return false;
+        }
+        let complete = true;
+        for (let mip = 0; mip < mipCount; ++mip) {
+            const data = texture.imageData[mip];
+            if (!(data instanceof Uint8Array) || texture.isImageDataLoaded?.[mip] === false) {
+                complete = false;
+                continue;
+            }
+            try {
+                this.device.queue.writeTexture(
+                    { texture: gpuTexture, mipLevel: mip },
+                    data,
+                    { offset: 0, bytesPerRow: texture.bytesPerRow >> mip, rowsPerImage: Math.max(1, texture.height >> mip) },
+                    texture.getMipSize(mip));
+            } catch (e) {
+                this.notes.add(`Texture ${texture.label || texture.id} could not be seeded with its captured contents: ${e.message ?? e}`);
+                return false;
+            }
+        }
+        return complete;
     }
 }
 
