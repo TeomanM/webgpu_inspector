@@ -835,7 +835,19 @@ export function createMcpServer(deps) {
         browserURL: args.browserURL,
         reloadPages: args.reloadPages
       });
-      return { browser: status, pages: bridge.listPages() };
+      // Reloaded tabs reconnect to the bridge a moment later; wait for them so
+      // the result lists them instead of looking like nothing connected.
+      const reloaded = browser.lastReloaded;
+      const result = { browser: status };
+      if (reloaded.length) {
+        const connected = await Promise.all(reloaded.map((id) => bridge.waitForPage(id, 20000)));
+        const missing = connected.filter((p) => !p).length;
+        if (missing) {
+          result.note = `${missing} reloaded tab(s) had not connected after 20s; check list_pages again shortly.`;
+        }
+      }
+      result.pages = bridge.listPages();
+      return result;
     },
 
     open_page: async (args) => {
@@ -1005,10 +1017,12 @@ export function createMcpServer(deps) {
     },
 
     get_frame_stats: async (args) => {
-      return await bridge.requestFrameStats({
+      // Drop the bridge's message envelope (type, requestId); keep the stats.
+      const { type, requestId, ...stats } = await bridge.requestFrameStats({
         pageId: args.pageId,
         durationMs: args.durationMs
       });
+      return stats;
     },
 
     get_render_graph: async (args) => {

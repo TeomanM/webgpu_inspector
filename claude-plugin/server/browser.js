@@ -103,6 +103,7 @@ export class BrowserController {
   async attach(options) {
     options = options || {};
     const browserURL = options.browserURL || "http://localhost:9222";
+    this._lastReloaded = [];
     if (this._browser) {
       // Attaching again to the same browser is a no-op, or a way to reload
       // open tabs that were loaded before instrumentation was in place.
@@ -144,21 +145,32 @@ export class BrowserController {
   // Future documents are covered by Page.addScriptToEvaluateOnNewDocument.
   // The current document of an already-open page is not, so optionally
   // reload real pages to bring the inspector into place before WebGPU runs.
+  // Returns the instance ids of the tabs it reloaded, so callers can wait for
+  // them to reconnect to the bridge.
   async _instrumentOpenPages(reload) {
+    const reloaded = [];
     for (const page of await this._browser.pages()) {
       try {
-        await this._instrumentPage(page);
+        const instanceId = await this._instrumentPage(page);
         if (reload && isRealPage(page.url()) && page !== this._replayPage) {
           await page.reload();
+          reloaded.push(instanceId);
         }
       } catch (e) {
         this._log(`could not instrument an existing page: ${e.message}`);
       }
     }
+    this._lastReloaded = reloaded;
+    return reloaded;
   }
 
   async _reloadOpenPages() {
-    await this._instrumentOpenPages(true);
+    return this._instrumentOpenPages(true);
+  }
+
+  // Instance ids reloaded by the most recent attach (empty when none were).
+  get lastReloaded() {
+    return this._lastReloaded || [];
   }
 
   // --- Instrumentation -----------------------------------------------------

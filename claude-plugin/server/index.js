@@ -31,7 +31,8 @@ async function main() {
   const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT || process.cwd();
   const capturesDir = process.env.WEBGPU_BRIDGE_CAPTURES_DIR || join(pluginRoot, "captures");
 
-  const store = new CaptureStore({ dir: capturesDir });
+  const maxFilesEnv = parseInt(process.env.WEBGPU_BRIDGE_MAX_CAPTURE_FILES ?? "", 10);
+  const store = new CaptureStore({ dir: capturesDir, maxFiles: Number.isNaN(maxFilesEnv) ? 20 : maxFilesEnv });
   await store.init();
   log(`captures directory: ${capturesDir}`);
 

@@ -6,7 +6,7 @@
 //   node claude-plugin/server/test/run.js
 
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -200,6 +200,32 @@ await test("CaptureStore round-trips a live capture (addLive -> getPayload -> re
     const meta2 = await store2.addFile(meta.path);
     assert.deepEqual([...store2.getPayload(meta2.id, 0)], [...bytes]);
     assert.equal(summarize(store2.getJson(meta2.id)).frame, 7);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+await test("CaptureStore never overwrites an earlier server's file and prunes old ones", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wgpucap-"));
+  try {
+    const payloads = () => new Map([[0, { typedArray: "Uint8Array", base64: vertexBytes().toString("base64") }]]);
+    // A leftover from the old naming, and an unrelated file that must survive.
+    await writeFile(join(dir, "cap-1.wgpuc"), "old");
+    await writeFile(join(dir, "keep-me.wgpuc"), "mine");
+
+    // Two "server restarts": both stores hand out cap-1.
+    const a = await new CaptureStore({ dir, maxFiles: 2 }).addLive({ metadata: syntheticCapture(), payloads: payloads() }, {});
+    await new Promise((r) => setTimeout(r, 20));
+    const storeB = new CaptureStore({ dir, maxFiles: 2 });
+    const b = await storeB.addLive({ metadata: syntheticCapture(), payloads: payloads() }, {});
+    assert.equal(a.id, "cap-1");
+    assert.equal(b.id, "cap-1");
+    assert.notEqual(a.path, b.path, "a restarted server must not reuse the file name");
+
+    const names = (await readdir(dir)).sort();
+    assert.ok(names.includes("keep-me.wgpuc"), "files the store didn't write are left alone");
+    assert.ok(!names.includes("cap-1.wgpuc"), "the oldest auto-saved file beyond the limit is pruned");
+    assert.equal(names.filter((n) => /cap-\d+\.wgpuc$/.test(n)).length, 2);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

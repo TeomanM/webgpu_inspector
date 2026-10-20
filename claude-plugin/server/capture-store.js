@@ -14,12 +14,22 @@
 
 import { createReadStream } from "node:fs";
 import { createWriteStream } from "node:fs";
-import { open, readFile, mkdir } from "node:fs/promises";
+import { open, readFile, mkdir, readdir, stat, unlink } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { resolve, isAbsolute, join } from "node:path";
 
 import { summarize } from "./analysis.js";
 import { isCaptureBinary, decodeCaptureBinary, encodeCaptureBinaryParts } from "./capture-binary.js";
+
+// Files addLive writes: "20261020-094012-123-cap-3.wgpuc", plus the older
+// "cap-3.wgpuc" naming so leftovers from before the timestamp are cleaned too.
+const AUTO_SAVED_FILE = /^(\d{8}-\d{6}-\d{3}-)?cap-\d+\.wgpuc$/;
+
+function fileStamp(date) {
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}-` +
+    `${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}-${p(date.getMilliseconds(), 3)}`;
+}
 
 export class CaptureStore {
   constructor(options) {
@@ -29,6 +39,8 @@ export class CaptureStore {
     // payloads: Map<payloadId, { typedArray, base64, bytes? }>
     this._captures = new Map();
     this._counter = 0;
+    // How many auto-saved capture files to keep on disk (0 = keep all).
+    this._maxFiles = options.maxFiles ?? 20;
   }
 
   async init() {
@@ -67,7 +79,9 @@ export class CaptureStore {
     // Persist so the capture survives and is loadable elsewhere. Written as
     // the WGPUCAP binary container, chunk by chunk with backpressure, so even
     // a multi-GB capture never builds a giant string or double-buffers.
-    const filePath = join(this._dir, `${id}.wgpuc`);
+    // Ids restart at cap-1 with every server, so the file name carries a
+    // timestamp too: a restart must not overwrite earlier sessions' files.
+    const filePath = join(this._dir, `${fileStamp(new Date())}-${id}.wgpuc`);
     try {
       await writeCaptureBinary(filePath, json, payloads);
       entry.path = filePath;
@@ -76,7 +90,47 @@ export class CaptureStore {
     }
 
     this._captures.set(id, entry);
+    await this._pruneFiles();
     return this.describe(entry);
+  }
+
+  // Keep the captures directory from growing without bound: delete the oldest
+  // auto-saved capture files beyond maxFiles. Only files named the way this
+  // store names them are touched, and never one an open capture points at.
+  async _pruneFiles() {
+    if (!(this._maxFiles > 0)) {
+      return;
+    }
+    let names;
+    try {
+      names = await readdir(this._dir);
+    } catch (e) {
+      return;
+    }
+    const inUse = new Set([...this._captures.values()].map((e) => e.path).filter(Boolean));
+    const files = [];
+    for (const name of names) {
+      if (!AUTO_SAVED_FILE.test(name)) {
+        continue;
+      }
+      const path = join(this._dir, name);
+      try {
+        files.push({ path, mtime: (await stat(path)).mtimeMs });
+      } catch (e) {
+        /* vanished meanwhile */
+      }
+    }
+    files.sort((a, b) => b.mtime - a.mtime);
+    for (const f of files.slice(this._maxFiles)) {
+      if (inUse.has(f.path)) {
+        continue;
+      }
+      try {
+        await unlink(f.path);
+      } catch (e) {
+        /* another session may have removed it */
+      }
+    }
   }
 
   // Load a capture from a file on disk and index it. Accepts all formats:

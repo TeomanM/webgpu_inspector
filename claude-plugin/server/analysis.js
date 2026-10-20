@@ -812,7 +812,8 @@ function buildSuggestions(capture, ctx) {
       out.push(`${who} is ${share} with a heavy fragment shader — optimize the shader (fewer texture ` +
         "samples, cheaper math, early-out) or shade fewer pixels.");
     } else {
-      out.push(`${who} is ${share} — the main GPU hotspot; profile its draws and shaders first.`);
+      const work = top.type === "compute" ? "dispatches" : "draws";
+      out.push(`${who} is ${share} — the main GPU hotspot; profile its ${work} and shaders first.`);
     }
   }
 
@@ -891,6 +892,21 @@ export function analyzePerformance(capture) {
   };
 }
 
+// profilePasses makes the inspector add its own timestampWrites to each pass,
+// marked with __wgpuInspectorTimestampIndex. They aren't the app's commands,
+// so hide them (an app's own timestampWrites carry no marker and are kept).
+function stripInspectorTimestamps(method, args) {
+  if ((method !== "beginRenderPass" && method !== "beginComputePass") || !Array.isArray(args)) {
+    return args;
+  }
+  const desc = args[0];
+  if (!desc || typeof desc !== "object" || desc.__wgpuInspectorTimestampIndex === undefined) {
+    return args;
+  }
+  const { timestampWrites, __wgpuInspectorTimestampIndex, ...rest } = desc;
+  return [rest, ...args.slice(1)];
+}
+
 // Paginated, base64-stripped command list, optionally filtered by method.
 export function listCommands(capture, options) {
   options = options || {};
@@ -926,7 +942,7 @@ export function listCommands(capture, options) {
       method: cmd.method,
       pass: passDepth > 0 ? passIndex : null,
       object: cmd.object !== undefined ? stripHeavy(cmd.object) : undefined,
-      args: cmd.args !== undefined ? stripHeavy(cmd.args) : undefined
+      args: cmd.args !== undefined ? stripInspectorTimestamps(cmd.method, stripHeavy(cmd.args)) : undefined
     };
     if (cmd.result !== undefined) {
       entry.result = stripHeavy(cmd.result);

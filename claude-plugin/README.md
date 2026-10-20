@@ -214,7 +214,10 @@ The MCP server reads these environment variables (set them in [.mcp.json](.mcp.j
 - `WEBGPU_BRIDGE_HOST` — bind address (default `127.0.0.1`).
 - `WEBGPU_BRIDGE_TOKEN` — if set, instrumented pages must present it.
 - `WEBGPU_BRIDGE_CAPTURES_DIR` — where uploaded captures are written (default
-  `<plugin>/captures`).
+  `<plugin>/captures`), as `<date>-<time>-<ms>-cap-N.wgpuc`.
+- `WEBGPU_BRIDGE_MAX_CAPTURE_FILES` — how many saved captures to keep in that
+  directory; the oldest beyond it are deleted after each new capture (default
+  `20`, `0` keeps everything).
 - `WEBGPU_BRIDGE_CHROME` — path to the Chrome/Edge binary for `launch_browser`
   (auto-detected if unset).
 - `WEBGPU_INSPECTOR_SCRIPT` — path or URL of the `webgpu_inspector.js` to
