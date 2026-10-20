@@ -916,7 +916,10 @@ export function buildRenderGraph(passes) {
         edges.push(edge);
         version.producer.outputs.push(edge);
         node.inputs.push(edge);
-      } else if (!version.producer) {
+      } else if (!version.producer && isRead) {
+        // A plain write (e.g. a write-only storage texture) keeps what it
+        // doesn't overwrite, but it doesn't read the resource, so the resource
+        // isn't an input to the frame.
         if (version.host) {
           resource.hostInput = true;
         } else {

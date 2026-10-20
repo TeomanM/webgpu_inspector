@@ -309,6 +309,17 @@ export async function measurePasses(passes, { device, database, getTextureFromAt
                     }
                 }
             }
+            if (missing.size) {
+                // Buffers without captured bytes replay as zeros, which collapses
+                // geometry and reads as "0 fragments". Leave the pass unmeasured
+                // rather than report counts that look real but aren't.
+                pass.unmeasured = "buffer data missing from the capture";
+                for (const note of missing) {
+                    notes.add(`${pass.label}: not measured — ${note}`);
+                }
+                notes.add(`${pass.label}: capture with buffer payloads (not payloads:"none") to count its fragments.`);
+                continue;
+            }
             applyUploads(replay, uploads);
             if (rasterItems.length < pass.draws) {
                 notes.add(`${pass.label}: ${pass.draws - rasterItems.length} draw(s) could not be replayed and are missing from its counts.`);
@@ -412,7 +423,9 @@ export function analyzePasses(passes) {
         }
         findings.sort((a, b) => SEVERITY[b.severity] - SEVERITY[a.severity]);
         pass.findings = findings;
-        pass.verdict = findings[0]?.title ?? (pass.kind === "render" && pass.rasterized !== undefined ? "Nothing stands out" : "");
+        pass.verdict = findings[0]?.title ??
+            (pass.kind === "render" && pass.unmeasured ? `Not measured (${pass.unmeasured})` :
+                pass.kind === "render" && pass.rasterized !== undefined ? "Nothing stands out" : "");
         issues.push(...findings);
     }
     // Most important first: severity, then the pass's share of GPU time.

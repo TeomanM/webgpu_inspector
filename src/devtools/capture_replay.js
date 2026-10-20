@@ -471,9 +471,8 @@ export async function getBindGroupForDraw(replay, pipelineInfo, pipelineId, grou
 // in webgpu_inspector.js): which offset each command.bufferData[entryIndex]
 // slice was read from, so uploads land where the replayed binding reads.
 function bindGroupUploads(replay, command, uploads, missing) {
-    if (!command.bufferData) {
-        return;
-    }
+    // No bufferData at all (a payloads:"none" capture) still falls through:
+    // addUpload reports each bound buffer as missing rather than staying silent.
     const bgObj = replay.database.getObject(command.args[1]?.__id);
     const entries = bgObj?.descriptor?.entries;
     if (!entries) {

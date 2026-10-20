@@ -183,13 +183,32 @@ function renderGraph(session) {
 /** The frame's passes in GPU order, the resources between them, and the graph's findings. */
 export function getRenderGraph(session, { includeResources = true } = {}) {
   const graph = renderGraph(session);
+  // Graph labels are quoted for the UI ("\"name\""); unquote them, and add the
+  // object id when several objects share a label so their entries can be told apart.
+  const unquote = (s) => (typeof s === "string" && s.length > 1 && s.startsWith("\"") && s.endsWith("\"") ? s.slice(1, -1) : s);
+  const idsByLabel = new Map();
+  for (const r of graph.resources) {
+    const base = unquote(r.objectLabel ?? r.label);
+    if (!idsByLabel.has(base)) {
+      idsByLabel.set(base, new Set());
+    }
+    idsByLabel.get(base).add(r.objectId);
+  }
+  const nameOf = (r) => {
+    const base = unquote(r.objectLabel ?? r.label);
+    const sub = r.objectLabel && r.label !== r.objectLabel ? r.label.slice(r.objectLabel.length) : "";
+    const shared = (idsByLabel.get(base)?.size ?? 0) > 1;
+    return `${base}${shared ? ` #${r.objectId}` : ""}${sub}`;
+  };
   const use = (u) => {
-    const out = { resource: u.resource.label, usage: u.usage };
+    const out = { resource: nameOf(u.resource), usage: u.usage };
     if (u.discards) {
-      out.discards = true;
+      // The pass replaces the contents (loadOp "clear", a full copy) instead of loading them.
+      out.replacesContents = true;
     }
     if (u.dropped) {
-      out.overwrittenBeforeRead = true;
+      // storeOp "discard": the result is thrown away when the pass ends.
+      out.storeDiscarded = true;
     }
     return out;
   };
@@ -200,7 +219,9 @@ export function getRenderGraph(session, { includeResources = true } = {}) {
       kind: n.kind,
       label: n.label,
       commandIndex: commandIndex(n.command) ?? n.commandIndex ?? null,
-      draws: n.draws,
+      // The graph counts draws and dispatches together; name them by pass kind.
+      draws: n.kind === "compute" ? undefined : n.draws,
+      dispatches: n.kind === "compute" ? n.draws : undefined,
       gpuMs: round(n.durationMs),
       reads: n.reads.map(use),
       writes: n.writes.map(use),
@@ -209,7 +230,7 @@ export function getRenderGraph(session, { includeResources = true } = {}) {
     })),
     criticalPath: graph.criticalPath.map((n) => n.ordinal),
     criticalPathMs: round(graph.criticalPathMs),
-    externalInputs: graph.externalInputs.map((r) => r.label),
+    externalInputs: [...new Set(graph.externalInputs.map(nameOf))],
     findings: findings.map((f) => ({
       rule: f.rule,
       severity: f.severity,
@@ -221,7 +242,7 @@ export function getRenderGraph(session, { includeResources = true } = {}) {
   };
   if (includeResources) {
     result.resources = graph.resources.map((r) => ({
-      name: r.label,
+      name: nameOf(r),
       objectId: r.objectId,
       type: r.type,
       detail: r.detail,
