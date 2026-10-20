@@ -284,7 +284,9 @@ export function createMcpServer(deps) {
     {
       name: "attach_browser",
       description: "Attach to an already-running Chrome/Edge that was started with " +
-        "--remote-debugging-port. New tabs and navigations are instrumented automatically.",
+        "--remote-debugging-port. New tabs and navigations are instrumented automatically. " +
+        "Calling it again for the same browser is safe: with reloadPages it reloads the open tabs " +
+        "(e.g. ones loaded before attaching) so they connect.",
       inputSchema: {
         type: "object",
         properties: {

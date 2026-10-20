@@ -102,14 +102,23 @@ export class BrowserController {
 
   async attach(options) {
     options = options || {};
+    const browserURL = options.browserURL || "http://localhost:9222";
     if (this._browser) {
+      // Attaching again to the same browser is a no-op, or a way to reload
+      // open tabs that were loaded before instrumentation was in place.
+      if (this._mode === "attach" && this._browserURL === browserURL) {
+        if (options.reloadPages === true) {
+          await this._reloadOpenPages();
+        }
+        return this.status();
+      }
       throw new Error(`Already connected to a browser in ${this._mode} mode. Detach first.`);
     }
     await this._loadInspectorSource();
 
-    const browserURL = options.browserURL || "http://localhost:9222";
     this._log(`attaching to browser at ${browserURL}`);
     this._browser = await puppeteer.connect({ browserURL, defaultViewport: null, protocolTimeout: REPLAY_TIMEOUT_MS });
+    this._browserURL = browserURL;
     this._mode = "attach";
     this._launched = false;
     await this._afterConnect(options.reloadPages === true);
@@ -129,19 +138,27 @@ export class BrowserController {
       this._replayPage = null;
     });
 
-    // Future documents are covered by Page.addScriptToEvaluateOnNewDocument.
-    // The current document of an already-open page is not, so optionally
-    // reload real pages to bring the inspector into place before WebGPU runs.
+    await this._instrumentOpenPages(reloadExisting);
+  }
+
+  // Future documents are covered by Page.addScriptToEvaluateOnNewDocument.
+  // The current document of an already-open page is not, so optionally
+  // reload real pages to bring the inspector into place before WebGPU runs.
+  async _instrumentOpenPages(reload) {
     for (const page of await this._browser.pages()) {
       try {
         await this._instrumentPage(page);
-        if (reloadExisting && isRealPage(page.url())) {
+        if (reload && isRealPage(page.url()) && page !== this._replayPage) {
           await page.reload();
         }
       } catch (e) {
         this._log(`could not instrument an existing page: ${e.message}`);
       }
     }
+  }
+
+  async _reloadOpenPages() {
+    await this._instrumentOpenPages(true);
   }
 
   // --- Instrumentation -----------------------------------------------------
