@@ -31,11 +31,16 @@
  * This module is pure source-to-source; measurement lives in the caller.
  */
 
-import { WgslParser, WgslReflect, For, While, Loop } from "wgsl_reflect/wgsl_reflect.module.js";
+import {
+  WgslParser, WgslReflect, For, While, Loop, Function as FunctionNode,
+  Call, Let, Var, Const, Assign, Increment, Return,
+} from "wgsl_reflect/wgsl_reflect.module.js";
 
 /** Name of the injected uniform struct and variable. */
 const ABLATION_STRUCT = "WGPUInspectorAblation";
 const ABLATION_VAR = "_wgpuInspectorAblation";
+/** Private flag a cut inside a helper function sets so its callers return too. */
+const ABLATION_STOP = "_wgpuInspectorAblationStop";
 
 /** WebGPU guarantees at least 4 bind groups. */
 const MAX_BIND_GROUPS = 4;
@@ -45,7 +50,7 @@ const MAX_BIND_GROUPS = 4;
  * one is four timed submissions). Loop bodies are dropped before top-level
  * statements when the budget is blown.
  */
-const MAX_CUT_POINTS = 64;
+const MAX_CUT_POINTS = 128;
 
 /**
  * A loop body is only safe to break down if control cannot leave it by any
@@ -150,7 +155,7 @@ function findEntryFunction(ast, stage, entryPoint) {
  * shader in every one of those measurements, so the statement's cost is a small
  * difference between two large numbers and drowns.
  */
-function collectCutPoints(statements, ctx, depth, parent) {
+function collectCutPoints(statements, ctx, depth, parent, frame) {
   const siblings = [];
 
   for (const statement of statements) {
@@ -169,9 +174,13 @@ function collectCutPoints(statements, ctx, depth, parent) {
       nextCut: null,
     };
     ctx.points.push(point);
-    ctx.inserts.push({ offset: statement.start, text: `${ctx.guard(point.cut)}\n  ` });
+    ctx.inserts.push({ offset: statement.start, text: `${frame.guard(point.cut)}\n  ` });
     siblings.push(point);
 
+    if (ctx.functions && !isLoop(statement)) {
+      descendIntoCall(statement, point, ctx, depth, frame);
+      continue;
+    }
     if (!ctx.nested || !isLoop(statement)) {
       continue;
     }
@@ -183,14 +192,14 @@ function collectCutPoints(statements, ctx, depth, parent) {
       ctx.skippedLoops++;
       continue;
     }
-    const inner = collectCutPoints(body, ctx, depth + 1, point);
+    const inner = collectCutPoints(body, ctx, depth + 1, point, frame);
     if (!inner.length) {
       continue;
     }
     // The synthetic block terminator: with this cut the first iteration runs to
     // completion and then returns, so the body's last statement has a partner.
     const endCut = ctx.next++;
-    ctx.inserts.push({ offset: body[body.length - 1].end, text: `\n  ${ctx.guard(endCut)}` });
+    ctx.inserts.push({ offset: body[body.length - 1].end, text: `\n  ${frame.guard(endCut)}` });
     inner[inner.length - 1].nextCut = endCut;
   }
 
@@ -198,6 +207,133 @@ function collectCutPoints(statements, ctx, depth, parent) {
     siblings[i].nextCut = siblings[i + 1].cut;
   }
   return siblings;
+}
+
+/** Statement kinds whose calls run unconditionally, once, when the statement runs. */
+function isStraightLine(node) {
+  return node instanceof Call || node instanceof Let || node instanceof Var ||
+    node instanceof Const || node instanceof Assign || node instanceof Increment;
+}
+
+/** Every `return` statement under an AST subtree, at any depth. */
+function findReturns(root) {
+  const found = [];
+  const seen = new Set();
+  const visit = (node) => {
+    if (!node || typeof node !== "object" || seen.has(node)) {
+      return;
+    }
+    seen.add(node);
+    if (node instanceof Return && node.hasSpan) {
+      found.push(node);
+    }
+    for (const key of Object.keys(node)) {
+      visit(node[key]);
+    }
+  };
+  visit(root);
+  return found;
+}
+
+function callRegex(name) {
+  return new RegExp(`\\b${name}\\s*\\(`, "g");
+}
+
+/**
+ * Cut points inside a helper function called by `statement`.
+ *
+ * A `return` inside the helper only leaves the helper, so a cut there sets a
+ * private stop flag before returning, and a check after the call site exits
+ * the caller too. The guards fire on the helper's first call, so the helper
+ * must be reachable only from this statement's function, and this statement
+ * must hold its first call there — otherwise an earlier call would stop first.
+ * Its statements are children of the call statement, measured like a loop
+ * body: one call's worth each, scaled to the statement's measured cost.
+ */
+function descendIntoCall(statement, point, ctx, depth, frame) {
+  if (!isStraightLine(statement)) {
+    return;
+  }
+  const text = ctx.code.slice(statement.start, statement.end);
+  for (const [name, fn] of ctx.functions) {
+    if (fn === frame.fn || ctx.instrumented.has(name)) {
+      continue;
+    }
+    const re = callRegex(name);
+    if (!re.test(text)) {
+      continue;
+    }
+    // Every call to the helper must be in the current function, the first one
+    // inside this statement.
+    let first = -1;
+    let elsewhere = false;
+    for (const other of ctx.allFunctions) {
+      // The helper's own declaration names it; recursion is invalid WGSL anyway.
+      if (other === fn) {
+        continue;
+      }
+      const matches = [...ctx.code.slice(other.start, other.end).matchAll(callRegex(name))];
+      if (other !== frame.fn && matches.length) {
+        elsewhere = true;
+        break;
+      }
+      if (other === frame.fn && matches.length) {
+        first = other.start + matches[0].index;
+      }
+    }
+    if (elsewhere || first < statement.start || first >= statement.end) {
+      continue;
+    }
+
+    let body = (fn.body ?? []).filter((s) => s?.hasSpan);
+    if (body.length && body[body.length - 1] instanceof Return) {
+      body = body.slice(0, -1);
+    }
+    if (!body.length) {
+      continue;
+    }
+    // A discard ends the invocation without passing any marker.
+    if (/\bdiscard\b/.test(ctx.code.slice(fn.start, fn.end))) {
+      ctx.skippedFunctions++;
+      continue;
+    }
+    let ret = "";
+    if (fn.returnType) {
+      const typeName = typeToWgsl(fn.returnType);
+      if (!typeName) {
+        continue;
+      }
+      ret = ` ${typeName}()`;
+    }
+
+    ctx.instrumented.add(name);
+    ctx.stopUsed = true;
+    const firstCut = ctx.next;
+    const inner = collectCutPoints(body, ctx, depth + 1, point, {
+      fn,
+      ret,
+      guard: (cut) => `if (${ABLATION_VAR}.cut == ${cut}u) { ${ABLATION_STOP} = true; return${ret}; }`,
+    });
+    if (!inner.length) {
+      continue;
+    }
+    const endCut = ctx.next++;
+    ctx.inserts.push({
+      offset: body[body.length - 1].end,
+      text: `\n  if (${ABLATION_VAR}.cut == ${endCut}u) { ${ABLATION_STOP} = true; return${ret}; }`,
+    });
+    inner[inner.length - 1].nextCut = endCut;
+    // An early return skips the markers after it. Leaving the helper by any
+    // return counts as reaching its end: when the cut lies anywhere inside the
+    // helper, the invocation stops there.
+    const stopOnExit = `if (${ABLATION_VAR}.cut >= ${firstCut}u && ${ABLATION_VAR}.cut <= ${endCut}u) { ${ABLATION_STOP} = true; return${ret}; }`;
+    for (const r of findReturns(fn.body)) {
+      ctx.inserts.push({ offset: r.start, text: `${stopOnExit}\n  ` });
+    }
+    ctx.inserts.push({ offset: statement.end, text: `\n  if (${ABLATION_STOP}) { return${frame.ret}; }` });
+    // One helper per statement keeps the attribution unambiguous.
+    return;
+  }
 }
 
 /**
@@ -291,9 +427,15 @@ export function instrumentForAblation(code, options = {}) {
   // more of them than a sweep can afford.
   const guard = (cut) => `if (${ABLATION_VAR}.cut == ${cut}u) { return${returnExpr}; }`;
   const notes = [];
-  const walk = (withNesting) => {
-    const ctx = { next: 0, points: [], inserts: [], code, guard, nested: withNesting, skippedLoops: 0 };
-    const top = collectCutPoints(statements, ctx, 0, null);
+  const allFunctions = ast.filter((s) => s instanceof FunctionNode && Array.isArray(s.body));
+  const helpers = new Map(allFunctions.filter((f) => f !== fn).map((f) => [f.name, f]));
+  const walk = (withNesting, withCalls) => {
+    const ctx = {
+      next: 0, points: [], inserts: [], code, nested: withNesting, skippedLoops: 0,
+      functions: withCalls && helpers.size ? helpers : null,
+      allFunctions, instrumented: new Set(), stopUsed: false, skippedFunctions: 0,
+    };
+    const top = collectCutPoints(statements, ctx, 0, null, { fn, ret: returnExpr, guard });
     if (top.length) {
       // Any cut past the last one runs the whole body.
       top[top.length - 1].nextCut = ctx.next;
@@ -301,12 +443,24 @@ export function instrumentForAblation(code, options = {}) {
     return ctx;
   };
 
-  let ctx = walk(nested);
+  // Finest breakdown first; drop helper calls, then loop bodies, when the
+  // sweep would take too many measurements.
+  let ctx = walk(nested, nested);
   if (nested && ctx.points.length > MAX_CUT_POINTS) {
-    notes.push(`Breaking the loops down would have taken ${ctx.points.length} measurements, past the ${MAX_CUT_POINTS} this sweep allows, so only top-level statements were measured.`);
-    ctx = walk(false);
-  } else if (ctx.skippedLoops > 0) {
+    const fine = ctx.points.length;
+    ctx = walk(true, false);
+    if (ctx.points.length > MAX_CUT_POINTS) {
+      notes.push(`Breaking the loops down would have taken ${ctx.points.length} measurements, past the ${MAX_CUT_POINTS} this sweep allows, so only top-level statements were measured.`);
+      ctx = walk(false, false);
+    } else {
+      notes.push(`Breaking helper functions down would have taken ${fine} measurements, past the ${MAX_CUT_POINTS} this sweep allows, so only the entry point and its loop bodies were measured.`);
+    }
+  }
+  if (ctx.skippedLoops > 0) {
     notes.push(`${ctx.skippedLoops} loop(s) were not broken down statement by statement, because their bodies can break, continue or return — control could then skip the injected end-of-body marker and the differencing would be measuring the wrong thing.`);
+  }
+  if (ctx.skippedFunctions > 0) {
+    notes.push(`${ctx.skippedFunctions} helper function(s) were not broken down, because they can discard.`);
   }
 
   // Splice the guards in back-to-front so earlier offsets stay valid.
@@ -320,7 +474,8 @@ export function instrumentForAblation(code, options = {}) {
   const binding = 0;
   const prelude =
     `struct ${ABLATION_STRUCT} { cut : u32 }\n` +
-    `@group(${group}) @binding(${binding}) var<uniform> ${ABLATION_VAR} : ${ABLATION_STRUCT};\n\n`;
+    `@group(${group}) @binding(${binding}) var<uniform> ${ABLATION_VAR} : ${ABLATION_STRUCT};\n` +
+    (ctx.stopUsed ? `var<private> ${ABLATION_STOP} : bool;\n` : "") + "\n";
 
   return {
     ok: true,

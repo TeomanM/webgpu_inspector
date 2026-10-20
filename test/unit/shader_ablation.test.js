@@ -394,3 +394,64 @@ test("nested loops distribute recursively", () => {
     assert.ok(Math.abs(x.ms - 0.75) < 1e-9, `x got ${x.ms}`);
     assert.ok(Math.abs(y.ms - 0.25) < 1e-9, `y got ${y.ms}`);
 });
+
+const HELPER_WGSL = `
+struct Sum { h : f32 }
+@group(0) @binding(0) var<storage, read_write> outv : array<f32>;
+
+fn add_system(x : f32, acc : ptr<function, Sum>) {
+  var t = 0.0;
+  for (var i = 0; i < 4; i++) { t += x; (*acc).h += t; }
+  (*acc).h *= 0.5;
+}
+
+fn early(x : f32) -> f32 {
+  if (x > 1.0) { return 1.0; }
+  return x;
+}
+
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid : vec3u) {
+  var acc : Sum;
+  add_system(1.0, &acc);
+  if (gid.x > 3u) { add_system(2.0, &acc); }
+  let e = early(acc.h);
+  outv[gid.x] = acc.h + e;
+}
+`;
+
+test("cuts go inside a helper function at its first call", () => {
+    const result = instrumentForAblation(HELPER_WGSL, { stage: "compute" });
+    assert.equal(result.ok, true, result.reason);
+    new WgslParser().parse(result.code);
+
+    const call = result.cutPoints.find((p) => p.depth === 0 && p.label.startsWith("add_system"));
+    const inside = result.cutPoints.filter((p) => p.parentCut === call.cut);
+    assert.deepEqual(inside.map((p) => p.label.split(" ")[0]), ["var", "for", "(*acc).h"]);
+    // The helper's loop body is broken down one level further.
+    const loop = inside.find((p) => p.label.startsWith("for"));
+    assert.equal(result.cutPoints.filter((p) => p.parentCut === loop.cut).length, 2);
+    // A cut in the helper flags the caller, which returns right after the call.
+    assert.match(result.code, /var<private> _wgpuInspectorAblationStop : bool;/);
+    assert.match(result.code, /add_system\(1\.0, &acc\);\n\s*if \(_wgpuInspectorAblationStop\) \{ return; \}/);
+    // The call inside the `if` is not instrumented again.
+    assert.doesNotMatch(result.code, /add_system\(2\.0, &acc\);\s*\n\s*if \(_wgpuInspectorAblationStop\)/);
+});
+
+test("a helper's early returns stop the invocation when the cut is inside it", () => {
+    const result = instrumentForAblation(HELPER_WGSL, { stage: "compute" });
+    new WgslParser().parse(result.code);
+    const call = result.cutPoints.find((p) => p.label.startsWith("let e"));
+    const inside = result.cutPoints.filter((p) => p.parentCut === call.cut);
+    assert.equal(inside.length, 1);
+    const first = inside[0].cut;
+    const end = inside[0].nextCut;
+    const check = `if (_wgpuInspectorAblation.cut >= ${first}u && _wgpuInspectorAblation.cut <= ${end}u) { _wgpuInspectorAblationStop = true; return f32(); }`;
+    // Both the early return and the final one get the check.
+    assert.equal(result.code.split(check).length - 1, 2);
+});
+
+test("nested:false keeps cuts out of helpers", () => {
+    const result = instrumentForAblation(HELPER_WGSL, { stage: "compute", nested: false });
+    assert.ok(result.cutPoints.every((p) => p.depth === 0));
+    assert.doesNotMatch(result.code, /_wgpuInspectorAblationStop/);
+});

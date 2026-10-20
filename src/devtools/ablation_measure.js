@@ -715,7 +715,7 @@ export async function measureStatementCosts({
             }
         }
         notes.push(instrumented.nested
-            ? "Cut points cover the entry point's top-level statements and the bodies of its loops. A statement inside an `if` or `switch` is still attributed to the enclosing statement rather than measured on its own."
+            ? "Cut points cover the entry point's top-level statements, the bodies of its loops, and the bodies of helper functions it calls (a helper's statements are measured on its first call and scaled to the calling statement's cost). A statement inside an `if` or `switch` is still attributed to the enclosing statement rather than measured on its own."
             : "Only the entry point's top-level statements are cut points. A statement inside a loop or branch is attributed to the enclosing top-level statement, not measured on its own.");
         notes.push(...(prepared.notes ?? []));
 
