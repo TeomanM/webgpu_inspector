@@ -583,7 +583,7 @@ function fragmentComplexity(code) {
 // One 8bpp 1080p target's worth of fill — the reference for "high fill workload".
 const FILL_REF = 1920 * 1080 * 8;
 
-// Per-render-pass performance profile: resolved render-target size/format/MSAA,
+// Per-pass performance profile (render and compute). Render passes carry resolved render-target size/format/MSAA,
 // blend usage, fragment-shader complexity, a relative fill-workload number, and
 // the measured GPU duration when the capture was taken with profilePasses.
 export function analyzeRenderPasses(capture) {
@@ -603,6 +603,7 @@ export function analyzeRenderPasses(capture) {
       const t = resolvePassTarget(objects, cmd);
       cur = {
         pass: passIndex,
+        type: "render",
         label: (cmd.args && cmd.args[0] && cmd.args[0].label) || "",
         beginCommand: i,
         draws: 0,
@@ -617,7 +618,18 @@ export function analyzeRenderPasses(capture) {
       continue;
     }
     if (m === "beginComputePass") {
-      cur = null;
+      // Compute passes count toward frame GPU time and pass numbering, so they
+      // are listed too (without render-target / fragment fields).
+      passIndex++;
+      cur = {
+        pass: passIndex,
+        type: "compute",
+        label: (cmd.args && cmd.args[0] && cmd.args[0].label) || "",
+        beginCommand: i,
+        dispatches: 0,
+        durationMs: (typeof cmd.duration === "number") ? cmd.duration : null
+      };
+      passes.push(cur);
       continue;
     }
     if (!cur) {
@@ -625,6 +637,12 @@ export function analyzeRenderPasses(capture) {
     }
     if (m === "end") {
       cur = null;
+      continue;
+    }
+    if (cur.type === "compute") {
+      if (DISPATCH_METHODS.has(m)) {
+        cur.dispatches++;
+      }
       continue;
     }
     if (DRAW_METHODS.has(m)) {
@@ -653,10 +671,25 @@ export function analyzeRenderPasses(capture) {
     }
   }
   return passes.map((p) => {
+    if (p.type === "compute") {
+      const out = {
+        pass: p.pass,
+        type: "compute",
+        label: p.label,
+        beginCommand: p.beginCommand,
+        dispatches: p.dispatches,
+        fillWorkload: null
+      };
+      if (p.durationMs != null) {
+        out.durationMs = round3(p.durationMs);
+      }
+      return out;
+    }
     const fillPixels = (p.width && p.height) ? p.width * p.height * p.sampleCount : null;
     const fillWorkload = (fillPixels != null) ? fillPixels * Math.max(1, p.bytesPerPixel) : null;
     const out = {
       pass: p.pass,
+      type: "render",
       label: p.label,
       beginCommand: p.beginCommand,
       draws: p.draws,
