@@ -2964,6 +2964,8 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
       } else if (method === "createBuffer") {
         const id = result.__id;
         this._sendAddObjectMessage(id, parent, "Buffer", this._stringifyDescriptor(args[0]), stacktrace);
+        // read_buffer needs the device to copy the buffer out.
+        Object.defineProperty(result, "__device", { value: object, enumerable: false, writable: true });
       } else if (method === "createTexture") {
         const id = result.__id;
         this._sendAddObjectMessage(id, parent, "Texture", this._stringifyDescriptor(args[0]), stacktrace);
@@ -3156,16 +3158,20 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
         newArgs.push(bufferOffset);
         let data = a[2];
         if (a.length > 3) {
+          // dataOffset/size count elements for a typed array and bytes for an
+          // ArrayBuffer, and a typed array may be a view into a larger buffer
+          // (e.g. a WASM heap), so its own byteOffset must be kept.
           const offset = a[3] ?? 0;
-         const size = a[4];
-          const buffer = this._isArrayBuffer(data) ? data : data.buffer;
-          if (!buffer) {
-            // It's a []<number>
-          } else if (size > 0) {
-            data = new Uint8Array(buffer, offset, size);
-          } else if (offset > 0) {
-            data = new Uint8Array(buffer, offset);
+          const size = a[4];
+          if (this._isArrayBuffer(data)) {
+            data = size !== undefined ? new Uint8Array(data, offset, size) : new Uint8Array(data, offset);
+          } else if (ArrayBuffer.isView(data)) {
+            const elementSize = data.BYTES_PER_ELEMENT ?? 1;
+            const start = data.byteOffset + offset * elementSize;
+            const length = size !== undefined ? size * elementSize : data.byteLength - offset * elementSize;
+            data = new Uint8Array(data.buffer, start, length);
           }
+          // Otherwise it's a []<number>; leave it as is.
         }
         // We can't push the actual data to the inspector server, it would be too much data.
         // Instead, we push a description of the data. If we actually want the data, we should

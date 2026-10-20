@@ -1089,11 +1089,16 @@ export function createMcpServer(deps) {
       const errors = result.errors || [];
       return {
         shaderId: args.shaderId,
-        replaced: errors.length === 0,
+        // The page swaps in the new code even when it fails to compile (as the
+        // DevTools shader editor does), so `replaced` is always true here and
+        // `valid` says whether it compiled.
+        replaced: true,
+        valid: errors.length === 0,
         pipelinesRecreated: result.pipelines,
         validationErrors: errors,
         note: errors.length
-          ? "The new code has errors, so the page may render wrongly or not at all. Fix it and replace again, or restore_shader."
+          ? "The new code was applied but has errors, so the affected pipelines are invalid and their draws " +
+            "no longer render. Fix it and replace again, or restore_shader."
           : "The page renders with the new code from its next frame. restore_shader undoes it."
       };
     },

@@ -7,10 +7,14 @@ import { WgslDebug } from "wgsl_reflect/wgsl_reflect.module.js";
 import { TextureView, Sampler } from "./gpu_objects/index.js";
 import { fetchVertexInputs } from "./vertex_fetcher.js";
 
+// The interpreter reads a binding's bytes from data.buffer starting at 0, so a
+// view into a larger buffer must be copied into its own. Copy through a plain
+// Uint8Array: on a Node Buffer (the plugin server's payloads, which small
+// sizes allocate from a shared pool) slice() returns a view, not a copy.
 function wholeBuffer(data) {
     if (ArrayBuffer.isView(data) &&
         (data.byteOffset !== 0 || data.byteLength !== data.buffer.byteLength)) {
-        return data.slice();
+        return new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
     }
     return data;
 }

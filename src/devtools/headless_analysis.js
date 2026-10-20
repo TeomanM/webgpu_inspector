@@ -825,7 +825,11 @@ function missingBindingData(session, bindGroupCommands) {
 }
 
 function missingNote(missing) {
-  return `the capture has no data for ${missing.join(", ")}; capture with payloads "all" to debug with real resource contents`;
+  // Data is missing either because payloads were off or because a resource was
+  // over the size caps (textures over maxTextureSize are skipped entirely).
+  return `the capture has no data for ${missing.join(", ")}; capture with payloads "all", and raise ` +
+    `maxTextureSize / maxBufferSize (or set them to -1) if these resources are larger than the caps, ` +
+    `to debug with real resource contents`;
 }
 
 function runDebugShader(session, params, command, isDispatch, state, desc, bindGroups, missing) {
