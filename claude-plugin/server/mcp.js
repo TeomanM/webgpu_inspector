@@ -395,7 +395,7 @@ export function createMcpServer(deps) {
             type: "boolean",
             description: "Inject per-pass GPU timestamp queries so each render/compute pass in the " +
               "capture carries a measured GPU duration (surfaced in get_capture_summary's passes " +
-              "breakdown as durationMs, and as frameGpuTimeMs total). Requires the adapter to support " +
+              "breakdown as durationMs, and as frameGpuTimeMs, the average per captured frame). Requires the adapter to support " +
               "the \"timestamp-query\" feature (the inspector enables it automatically when available); " +
               "a no-op otherwise. Default false. Pairs well with payloads:\"none\" for a light perf pass."
           }

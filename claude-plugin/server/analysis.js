@@ -325,8 +325,11 @@ export function summarize(capture, options) {
           slowest = p;
         }
       }
+      const perFrame = averageFrameGpuMs(capture, timed);
       summary.gpuTiming = {
-        frameGpuTimeMs: Math.round(total * 1000) / 1000,
+        frameGpuTimeMs: round3(perFrame.ms),
+        capturedFrames: perFrame.frames,
+        totalGpuTimeMs: Math.round(total * 1000) / 1000,
         timedPasses: timed.length,
         slowestPass: { pass: slowest.pass, label: slowest.label, durationMs: slowest.durationMs }
       };
@@ -843,15 +846,37 @@ function buildSuggestions(capture, ctx) {
   return out;
 }
 
+// GPU time of one frame, averaged over the frames in the capture. A capture can
+// hold several frames (capture_frames count > 1); comparing their summed pass
+// time against a single frame's budget would overstate the GPU load N times.
+// Frames are split by metadata.frameStarts; older captures without it count as one.
+export function averageFrameGpuMs(capture, timedPasses) {
+  const starts = Array.isArray(capture && capture.frameStarts) && capture.frameStarts.length
+    ? capture.frameStarts : [0];
+  const perFrame = new Map();
+  for (const p of timedPasses) {
+    let f = 0;
+    while (f + 1 < starts.length && starts[f + 1] <= p.beginCommand) {
+      f++;
+    }
+    perFrame.set(f, (perFrame.get(f) || 0) + p.durationMs);
+  }
+  let total = 0;
+  for (const ms of perFrame.values()) {
+    total += ms;
+  }
+  const frames = Math.max(1, perFrame.size);
+  return { ms: total / frames, frames };
+}
+
 // Full performance report for a capture: frame budget + bound verdict, GPU timing,
 // passes ranked by cost with per-pass bottleneck classification, heuristic issues,
 // and concrete suggestions. This is the one-call "diagnose performance" entry point.
 export function analyzePerformance(capture) {
   const passInfos = analyzeRenderPasses(capture);
   const timed = passInfos.filter((p) => typeof p.durationMs === "number");
-  const frameGpuTimeMs = timed.length
-    ? round3(timed.reduce((s, p) => s + p.durationMs, 0))
-    : null;
+  const perFrame = timed.length ? averageFrameGpuMs(capture, timed) : null;
+  const frameGpuTimeMs = perFrame ? round3(perFrame.ms) : null;
   const timingStatus = gpuTimingStatus(capture, frameGpuTimeMs);
 
   const fs = capture && capture.frameStats;

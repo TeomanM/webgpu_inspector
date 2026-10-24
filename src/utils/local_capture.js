@@ -83,6 +83,8 @@ export class LocalCaptureStore {
     // Track the frame number of the first captured frame so the export reports
     // a meaningful `frame` field. Defaults to 0 if nothing was captured.
     this._firstFrame = null;
+    // Command index where each captured frame begins (across all slots).
+    this._frameStarts = [];
     // commandId -> array of CaptureBufferData messages that arrived before the
     // corresponding command record. Drained when the command lands.
     this._pendingBufferData = new Map();
@@ -111,6 +113,7 @@ export class LocalCaptureStore {
     this._commands = [];
     this._currentSlot = null;
     this._firstFrame = null;
+    this._frameStarts = [];
     this._pendingBufferData.clear();
     this._timestampBytes = null;
     this._timestampChunksRemaining = 0;
@@ -125,6 +128,7 @@ export class LocalCaptureStore {
     this._commands = [];
     this._currentSlot = null;
     this._firstFrame = null;
+    this._frameStarts = [];
     this._pendingBufferData.clear();
     this._timestampBytes = null;
     this._timestampChunksRemaining = 0;
@@ -233,6 +237,11 @@ export class LocalCaptureStore {
       count,
       batchesRemaining: message.batches | 0
     };
+    const starts = Array.isArray(message.frameStarts) && message.frameStarts.length
+      ? message.frameStarts : [0];
+    for (const s of starts) {
+      this._frameStarts.push(start + s);
+    }
     if (this._firstFrame === null) {
       this._firstFrame = message.frame;
     }
@@ -403,6 +412,10 @@ export class LocalCaptureStore {
       }
       const start = timestampData[index];
       const end = timestampData[index + 1];
+      // Unwritten (0) or error (-1) timestamps leave the pass untimed.
+      if (start <= 0n || end <= 0n || end < start) {
+        continue;
+      }
       command.startTime = Number(start) / 1000000.0;
       command.endTime = Number(end) / 1000000.0;
       command.duration = Number(end - start) / 1000000.0;
@@ -465,6 +478,7 @@ export class LocalCaptureStore {
       toolVersion: toolVersion || "",
       exportedAt: new Date().toISOString(),
       frame: this._firstFrame ?? 0,
+      frameStarts: this._frameStarts.length ? this._frameStarts.slice() : [0],
       statistics: {},
       validationErrors: this._validationErrors.slice(),
       objects,

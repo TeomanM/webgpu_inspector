@@ -12,6 +12,7 @@ import { Signal } from "../utils/signal.js";
     frame: number;
     count: number;
     batches: number;
+    frameStarts?: number[]; // index of each captured frame's first command
 }*/
 
 /*interface CaptureFrameCommandsMessage {
@@ -142,10 +143,22 @@ export class CaptureData {
     this.commands.length = count;
     this.frameIndex = frame;
     this._captureCount = batches;
+    this.frameStarts = Array.isArray(message.frameStarts) && message.frameStarts.length
+      ? message.frameStarts : [0];
     // Reset any timestamp buffer left over from a previous capture so this
     // capture allocates a fresh buffer sized for its own timestamp data.
     this._timestampBuffer = null;
     this._timestampChunkCount = 0;
+  }
+
+  // Which captured frame (0-based) the command at `index` belongs to.
+  _frameOfCommand(index) {
+    const starts = this.frameStarts ?? [0];
+    let f = 0;
+    while (f + 1 < starts.length && starts[f + 1] <= index) {
+      f++;
+    }
+    return f;
   }
 
   /**
@@ -299,6 +312,7 @@ export class CaptureData {
                 command.method === "beginComputePass") {
               if (valid) {
                 command.duration = duration;
+                command.captureFrame = this._frameOfCommand(k);
                 command.startTime = Number(start) / 1000000.0;
                 command.endTime = Number(end) / 1000000.0;
                 timestampMap.push(command);
@@ -336,11 +350,26 @@ export class CaptureData {
         // Whole-frame GPU busy time = first pass start -> last pass end. This covers gaps
         // between passes; a bare sum of durations would undercount serialized idle. Feeds
         // the panel's CPU-vs-GPU bound verdict.
+        // Computed per captured frame and averaged: a span across a multi-frame
+        // capture would include the idle time between frames.
+        const spans = new Map();
+        for (const c of timestampMap) {
+          const f = c.captureFrame ?? 0;
+          const span = spans.get(f);
+          if (!span) {
+            spans.set(f, { start: c.startTime, end: c.endTime });
+          } else {
+            span.start = Math.min(span.start, c.startTime);
+            span.end = Math.max(span.end, c.endTime);
+          }
+        }
         let gpuFrameTime = 0;
-        if (timestampMap.length) {
-          const first = timestampMap[0];
-          const last = timestampMap.reduce((a, b) => (b.endTime > a.endTime ? b : a));
-          gpuFrameTime = last.endTime - first.startTime;
+        if (spans.size) {
+          let total = 0;
+          for (const span of spans.values()) {
+            total += span.end - span.start;
+          }
+          gpuFrameTime = total / spans.size;
         }
         this.gpuFrameTime = gpuFrameTime;
         if (this.database) {

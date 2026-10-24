@@ -949,7 +949,8 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
         "action": Actions.CaptureFrameResults,
         "frame": this._frameIndex,
         "count": commands.length,
-        batches
+        batches,
+        "frameStarts": this._capturedFrameStarts
       });
       for (let i = 0; i < commands.length; i += maxFrameCount) {
         const length = Math.min(maxFrameCount, commands.length - i);
@@ -2621,6 +2622,13 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
     _takeFrameCaptureCommands() {
       const frames = this._frameCaptureCommands;
       this._frameCaptureCommands = [];
+      // Index of each frame's first command, so the panel can split per-frame stats.
+      const frameStarts = [];
+      for (let i = 0, n = 0; i < frames.length; ++i) {
+        frameStarts.push(n);
+        n += frames[i].length;
+      }
+      this._capturedFrameStarts = frameStarts;
       if (frames.length === 1) {
         return frames[0];
       }
@@ -2645,7 +2653,8 @@ const TEXTURE_USAGE_TRANSIENT_ATTACHMENT = 0x20;
       const commands = this._takeFrameCaptureCommands();
 
       const batches = Math.ceil(commands.length / maxFrameCount);
-      this._postMessage({ "action": Actions.CaptureFrameResults, "frame": this._frameIndex, "count": commands.length, "batches": batches });
+      this._postMessage({ "action": Actions.CaptureFrameResults, "frame": this._frameIndex, "count": commands.length, "batches": batches,
+        "frameStarts": this._capturedFrameStarts });
 
       for (let i = 0; i < commands.length; i += maxFrameCount) {
         const length = Math.min(maxFrameCount, commands.length - i);
